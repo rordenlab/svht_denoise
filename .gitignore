@@ -1,0 +1,18 @@
+# Build products
+src/*.o
+src/*.d
+src/svht_denoise
+*.dSYM/
+
+# Build flag stamp (see src/Makefile)
+src/.build_flags
+
+# Benchmark output
+benchmark/dwidenoise/
+benchmark/svht_denoise/
+
+# Audit scratch
+audit_*.md
+
+# macOS
+.DS_Store
