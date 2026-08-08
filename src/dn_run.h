@@ -18,6 +18,7 @@ typedef struct {
 	float *out;             // nvox3d * nvol, zero-initialised by the caller
 	float *noise;           // nvox3d, or NULL
 	uint16_t *rank;         // nvox3d, or NULL
+	size_t n_work;      // voxels the mask actually selects (nvox3d when unmasked)
 	int nthreads;
 } dn_run;
 
@@ -34,7 +35,7 @@ int dn_default_threads(void);
 // The team size that will ACTUALLY be used for this geometry: `requested`,
 // capped by the number of work chunks and by a scratch-memory budget.  Exposed
 // so the CLI reports the effective count rather than the requested one.
-int dn_effective_threads(const dn_geom *g, int requested);
+int dn_effective_threads(const dn_geom *g, size_t n_work, int requested);
 
 #ifdef __cplusplus
 }

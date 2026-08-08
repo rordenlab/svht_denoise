@@ -21,6 +21,13 @@ typedef struct {
 	int nx, ny, nz;
 	int nvol;
 	size_t nvox3d;
+	// The nifti_type the INPUT was read with, kept separately because nim's own
+	// copy does not survive the first write: nifti_set_filenames() rewrites it to
+	// match whatever names it just built.  Since all outputs share one nim, a
+	// single .hdr/.img output would otherwise silently switch every LATER
+	// extensionless output from .nii to .hdr/.img -- names the collision check
+	// never modelled, which is how an output came to land on an input at exit 0.
+	int nifti_type;
 } dn_image;
 
 // Read `fname` and convert to float32.  `role` appears in error messages ("input",
@@ -41,6 +48,39 @@ uint8_t *dn_mask_build(const dn_image *ref, const char *fname, size_t *n_in_mask
 // because a collision check on the typed strings misses names that normalise
 // onto the same file.  Caller frees both.  Returns 0 on success.
 int dn_resolve_names(const char *prefix, int nifti_type, char **hdr, char **img);
+
+// Resolve an INPUT path to the header and image files the reader will really
+// OPEN.  This is not the same question dn_resolve_names answers: that one
+// derives where an output would be WRITTEN, and the two diverge exactly where it
+// matters.  Given "x" with an existing x.hdr/x.img pair on disk, the reader
+// opens the pair while the output derivation says "x.nii", so a collision check
+// built on the latter declares "x" and "x.hdr" to be different files and lets an
+// output land on an input.  Delegated to the reader itself, header only, so the
+// answer cannot drift from what the real read will do.
+// Caller frees both.  Returns 0 on success, non-zero if the image cannot be
+// opened at all -- which is worth failing on early, before anything is written.
+int dn_resolve_input_names(const char *path, char **hdr, char **img);
+
+// How far apart, in millimetres, do two headers place the same voxel?
+//
+// Matching dimensions do not establish that two images sample the same physical
+// grid: they can be the same size and still differ in voxel size, orientation or
+// origin, and combining them then mixes unrelated tissue into a plausible-looking
+// result.  Measured over the eight volume corners, because that is the only
+// comparison that means anything -- element-wise equality of the affines both
+// over-rejects (two encodings of one transform) and under-rejects (a small
+// matrix change is a large displacement far from the origin).  Both headers are
+// normalised to millimetres via xyz_units first.
+//
+// Follows niimath's md_same_grid (BSD-2-Clause, rordenlab/niimath), including
+// its gate.  Corners are taken from `a`; compare dimensions first.
+//
+// Compare against DN_GRID_TOL_MM, and write the test so that a non-finite offset
+// fails closed.  Real magnitude/phase pairs out of one reconstruction agree
+// EXACTLY (measured at 0.0 mm on the EDDEN dataset), so the tolerance is there
+// for headers that have been round-tripped, not for genuine disagreement.
+#define DN_GRID_TOL_MM 0.001f
+float dn_grid_offset_mm(const dn_image *a, const dn_image *b);
 
 // Write outputs derived from `ref`'s geometry.  `nvol` volumes of float32, or a
 // single volume of uint16.  Returns 0 on success.

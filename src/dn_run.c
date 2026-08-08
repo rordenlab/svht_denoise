@@ -138,10 +138,14 @@ static void *worker(void *arg) {
 	return NULL;
 }
 
-int dn_effective_threads(const dn_geom *g, int requested) {
+int dn_effective_threads(const dn_geom *g, size_t n_work, int requested) {
 	if (!g) return 1;
 	if (requested < 1) requested = 1;
-	const size_t total = g->nvox3d;
+	// Voxels that will actually be VISITED, not the whole grid: a one-voxel mask
+	// otherwise started every core and gave each a full eigensolver arena for a
+	// single eigensolve.  Thread count does not affect the output, so this is
+	// free of the byte-identity promise.
+	const size_t total = n_work;
 	// More workers than cores never helps a CPU-bound kernel, and more workers
 	// than chunks is pure overhead -- the extras allocate a full scratch arena,
 	// find the queue empty and exit.
@@ -160,7 +164,7 @@ int dn_effective_threads(const dn_geom *g, int requested) {
 
 int dn_run_execute(const dn_run *r) {
 	if (!r || !r->g || !r->img || !r->out) return 1;
-	int nthreads = dn_effective_threads(r->g, r->nthreads);
+	int nthreads = dn_effective_threads(r->g, r->n_work, r->nthreads);
 
 	dn_pool pool;
 	memset(&pool, 0, sizeof(pool));

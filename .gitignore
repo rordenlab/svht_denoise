@@ -2,6 +2,7 @@
 src/*.o
 src/*.d
 src/svht_denoise
+src/dn_testgen
 *.dSYM/
 
 # Build flag stamp (see src/Makefile)
@@ -10,9 +11,18 @@ src/.build_flags
 # Benchmark output
 benchmark/dwidenoise/
 benchmark/svht_denoise/
+/edden/mrtrix/
+/edden/svht_denoise/
 
 # Audit scratch
 audit_*.md
 
+# Python bytecode (edden/mrtrix.py)
+__pycache__/
+*.pyc
+
 # macOS
 .DS_Store
+
+# macOS release artifacts
+dist/

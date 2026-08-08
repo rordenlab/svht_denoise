@@ -159,6 +159,7 @@ int dn_image_read(const char *fname, const char *role, int require4d, dn_image *
 
 	img->nim = nim;
 	img->data = data;
+	img->nifti_type = nim->nifti_type;
 	img->nx = (int)nim->nx;
 	img->ny = (int)nim->ny;
 	img->nz = (int)nim->nz;
@@ -184,6 +185,13 @@ uint8_t *dn_mask_build(const dn_image *ref, const char *fname, size_t *n_in_mask
 		dn_image_free(&m);
 		return NULL;
 	}
+	// Dimensions only, and DELIBERATELY not dn_grid_offset_mm, which -phase does
+	// use.  The asymmetry is intended: a mask that is off-grid selects the wrong
+	// voxels, which is visible in the output, whereas an off-grid phase image
+	// corrupts every value while looking
+	// entirely plausible.  Masks also routinely arrive from another tool with a
+	// cosmetically different sform, so a 0.001 mm gate here would reject setups
+	// that work today for no safety gain.  Do not "fix" this to match -phase.
 	if (m.nx != ref->nx || m.ny != ref->ny || m.nz != ref->nz) {
 		dn_err("mask '%s' is %dx%dx%d but the input is %dx%dx%d\n",
 		       fname, m.nx, m.ny, m.nz, ref->nx, ref->ny, ref->nz);
@@ -247,6 +255,66 @@ int dn_resolve_names(const char *prefix, int nifti_type, char **hdr, char **img)
 	return 0;
 }
 
+int dn_resolve_input_names(const char *path, char **hdr, char **img) {
+	if (hdr) *hdr = NULL;
+	if (img) *img = NULL;
+	if (!path || !hdr || !img) return 1;
+
+	// read_data = 0: this costs the header and a disk search, not the image.
+	nifti_image *nim = nifti_image_read(path, 0);
+	if (!nim) return 1;
+	char *h = nim->fname ? strdup(nim->fname) : NULL;
+	char *i = nim->iname ? strdup(nim->iname) : NULL;
+	nifti_image_free(nim);
+	if (!h || !i) { free(h); free(i); return 1; }
+	*hdr = h;
+	*img = i;
+	return 0;
+}
+
+// nifti's own preference: the sform when it is set, else the qform.  When
+// neither carries a code, qto_xyz still holds the transform nifti_io derived
+// from pixdim, and comparing those catches a voxel-size mismatch, which is the
+// failure worth catching in an ANALYZE-style header.
+static nifti_dmat44 best_affine(const nifti_image *n) {
+	return (n->sform_code > 0) ? n->sto_xyz : n->qto_xyz;
+}
+
+static double unit_scale_mm(int xyz_units) {
+	switch (xyz_units) {
+	case NIFTI_UNITS_METER:  return 1000.0;
+	case NIFTI_UNITS_MICRON: return 0.001;
+	default:                 return 1.0;   // millimetres, or unstated
+	}
+}
+
+float dn_grid_offset_mm(const dn_image *a, const dn_image *b) {
+	if (!a || !b || !a->nim || !b->nim) return INFINITY;   // no answer, so fail closed
+	const nifti_dmat44 ma = best_affine(a->nim), mb = best_affine(b->nim);
+	const double sa = unit_scale_mm(a->nim->xyz_units);
+	const double sb = unit_scale_mm(b->nim->xyz_units);
+
+	double worst = 0.0;
+	for (int c = 0; c < 8; c++) {
+		const double i = (c & 1) ? (double)a->nx - 1.0 : 0.0;
+		const double j = (c & 2) ? (double)a->ny - 1.0 : 0.0;
+		const double k = (c & 4) ? (double)a->nz - 1.0 : 0.0;
+		double d2 = 0.0;
+		for (int r = 0; r < 3; r++) {
+			const double pa = sa * (ma.m[r][0] * i + ma.m[r][1] * j + ma.m[r][2] * k + ma.m[r][3]);
+			const double pb = sb * (mb.m[r][0] * i + mb.m[r][1] * j + mb.m[r][2] * k + mb.m[r][3]);
+			d2 += (pa - pb) * (pa - pb);
+		}
+		// NOT `if (d2 > worst)`: a NaN comparison is false, so a NaN corner would
+		// leave `worst` at 0 and the caller would read "same grid" -- failing
+		// OPEN, the exact opposite of the documented contract.  Terminal, because
+		// a later finite corner would otherwise overwrite it.
+		if (!isfinite(d2)) return INFINITY;
+		if (d2 > worst) worst = d2;
+	}
+	return (float)sqrt(worst);
+}
+
 // Write `data` using ref's geometry.
 //
 // This MUTATES ref->nim -- datatype, dimensions, scaling, filenames and the data
@@ -262,6 +330,11 @@ int dn_resolve_names(const char *prefix, int nifti_type, char **hdr, char **img)
 static int write_image(dn_image *ref, const char *fname,
                        void *data, int datatype, int nbyper, int nvol) {
 	nifti_image *nim = ref->nim;
+
+	// Restore the input's type FIRST.  nifti_set_filenames() below rewrites
+	// nim->nifti_type from the names it derives, and that mutation would
+	// otherwise leak into the next output's name resolution -- see dn_image.
+	nim->nifti_type = ref->nifti_type;
 
 	nim->datatype = datatype;
 	nim->nbyper = nbyper;
