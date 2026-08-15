@@ -8,7 +8,7 @@ The tool works on magnitude volumes, and on complex data when the phase is also 
 
 ## Building
 
-Requires a C99 compiler on a POSIX system (macOS, Linux, WSL), plus libm, pthreads and zlib — all standard on those platforms. On macOS the build supplies its own zlib (see below), so only libm and pthreads come from the system.
+Requires a C99 compiler on a POSIX system (macOS, Linux, WSL), plus libm, pthreads and zlib — all standard on those platforms. On macOS the build supplies its own zlib (see below) and reduces through Accelerate, so nothing has to be installed for either.
 
 ```
 git clone --recursive https://github.com/rordenlab/svht_denoise
@@ -28,6 +28,10 @@ git submodule update --init ../third_party/zlib-ng    # from src, after a plain 
 ```
 
 Elsewhere the system zlib is the default, since this was measured only on Apple Silicon; `ZLIBNG_ROOT` still works there if you want it.
+
+On macOS the eigensolver's Householder reduction and back-transform come from LAPACK's `dsytrd` and `dormtr` in Apple's [Accelerate](https://developer.apple.com/accelerate/) framework, which is worth **-14% wall clock and -16% CPU** on a 138-volume series. It is a system framework rather than a library to install or bundle: present on every macOS the tool targets, resolved at load like libSystem, and it adds nothing to the executable. `make ACCELERATE=0` builds the portable reduction instead, which is what every other platform uses.
+
+A blocked reduction is a different algorithm rather than a faster spelling of the same one, so the two builds do not agree bit for bit — about 3e-10 in relative L2, with the rank map identical. Byte-identical output across thread counts, which is the guarantee this tool actually makes, holds within either. `make` prints which reduction went in, alongside which zlib.
 
 This writes the `svht_denoise` executable into `src`. Run `./svht_denoise -help` for the full list of options.
 
@@ -76,7 +80,7 @@ The rotation is serial, so it adds about 0.37 s of wall clock to a 2.1 s run (~1
 
 ## macOS release packages
 
-A signed, notarized, stapled installer can be built from `src`. It installs an Apple Silicon (arm64) binary into `/usr/local/bin`, targets macOS 11 or newer, and links only against libSystem — zlib-ng is embedded statically, so there is no `libz` dependency. The packaging script refuses to build without the zlib-ng submodule, and separately proves the static link happened by checking that the finished binary does not name `libz` at all; the system-zlib fallback that is right for a working copy would otherwise ship silently, being ~3× slower with nothing about the binary to say so.
+A signed, notarized, stapled installer can be built from `src`. It installs an Apple Silicon (arm64) binary into `/usr/local/bin`, targets macOS 14 or newer, and links only against libSystem and Accelerate — zlib-ng is embedded statically, so there is no `libz` dependency. The packaging script refuses to build without the zlib-ng submodule, and separately proves the static link happened by checking that the finished binary does not name `libz` at all; the system-zlib fallback that is right for a working copy would otherwise ship silently, being ~3× slower with nothing about the binary to say so.
 
 Releases are arm64 only. This is a compute-bound tool, and the Intel Macs a universal build would have served are the slowest machines that could run it — on a platform macOS 26 is the last release to support. Building from source on an Intel Mac is unaffected: a plain `make` produces a native binary there as it always did. Cutting a *release* does require an Apple Silicon host, because the packaging script runs the test suite against the arm64 binary it builds; it says so and stops before building if run elsewhere. The installer itself declares `hostArchitectures="arm64"`, so an Intel Mac refuses it rather than installing a binary that cannot run.
 

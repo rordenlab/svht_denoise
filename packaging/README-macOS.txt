@@ -6,7 +6,7 @@ default PATH, so it is ready to use immediately:
 
   svht_denoise
 
-The binary is for Apple Silicon (arm64). This build requires macOS 11 or newer;
+The binary is for Apple Silicon (arm64). This build requires macOS 14 or newer;
 the minimum is set at build time by MACOSX_DEPLOYMENT_TARGET. It is entirely
 self-contained: it links only against libSystem, which ships with macOS, and
 statically embeds zlib-ng for reading and writing .nii.gz. There is no folder

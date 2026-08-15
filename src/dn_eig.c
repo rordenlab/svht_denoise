@@ -26,11 +26,19 @@
 
 #ifdef DN_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
+
 // Evaluation build (`make ACCELERATE=1`): LAPACK's blocked dsytrd replaces the
 // reduction, and dormtr the back-transform, on the SPLIT path only.  The full
 // path (n < DN_SPLIT_MIN) is untouched, because the reduction is not where its
 // time goes.  `hh` carries LAPACK's tau instead of our h values -- same length,
 // same lifetime, so it is reused rather than duplicated.
+// The NEW LAPACK interface, which binds to dsytrd$NEWLAPACK.  Those symbols
+// first exist in macOS 13.3, so this spelling and the deployment target are
+// tied together: built against anything older, the binary passes every check in
+// the packaging script and then dies at launch with a missing symbol.  Releases
+// target 14.0, which clears it; below 13.3 the legacy CLAPACK names are
+// required here instead.
+typedef __LAPACK_int dn_lpk;
 #endif
 
 struct dn_eig {
@@ -356,7 +364,7 @@ static void tred_apply_q(const double *V, const double *hh, double *z, int n) {
 // the pointer by one converts between them for free.
 static void tred_reduce_accel(dn_eig *eg, double *V, double *d, double *e,
                               double *tau, int n) {
-	__LAPACK_int N = n, LDA = n, LW = eg->lwork, INFO = 0;
+	dn_lpk N = n, LDA = n, LW = eg->lwork, INFO = 0;
 	dsytrd_("U", &N, V, &LDA, d, e + 1, tau, eg->lwk, &LW, &INFO);
 	e[0] = 0.0;
 }
@@ -366,7 +374,7 @@ static void tred_reduce_accel(dn_eig *eg, double *V, double *d, double *e,
 // per-vector loop this replaces collapses into one call.
 static void tred_apply_q_accel(dn_eig *eg, const double *V, const double *tau,
                                double *C, int nc, int n) {
-	__LAPACK_int N = n, NC = nc, LDA = n, LDC = n, LW = eg->lwork, INFO = 0;
+	dn_lpk N = n, NC = nc, LDA = n, LDC = n, LW = eg->lwork, INFO = 0;
 	dormtr_("L", "U", "N", &N, &NC, (double *)V, &LDA, (double *)tau,
 	        C, &LDC, eg->lwk, &LW, &INFO);
 }
@@ -540,7 +548,7 @@ dn_eig *dn_eig_create(int n) {
 	// for millions of solves.  Take the larger of the two, and never less than
 	// the documented minimum each guarantees to work with.
 	{
-		__LAPACK_int N = n, LDA = n, NC = n, LDC = n, QUERY = -1, INFO = 0;
+		dn_lpk N = n, LDA = n, NC = n, LDC = n, QUERY = -1, INFO = 0;
 		double wq1 = 0.0, wq2 = 0.0;
 		dsytrd_("U", &N, e->refl, &LDA, e->td, e->te, e->hh, &wq1, &QUERY, &INFO);
 		dormtr_("L", "U", "N", &N, &NC, e->refl, &LDA, e->hh, e->w, &LDC,

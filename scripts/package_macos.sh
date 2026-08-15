@@ -12,7 +12,7 @@
 #                             with the Application certificate is rejected by
 #                             the installer. Leave unset for an unsigned
 #                             package: local testing only, cannot be notarised.
-#   MACOSX_DEPLOYMENT_TARGET  oldest macOS supported (default 11.0).
+#   MACOSX_DEPLOYMENT_TARGET  oldest macOS supported (default 14.0).
 #
 # Releases are arm64 only. This is a compute-bound tool and the Intel Macs a
 # universal build would have served are the slowest machines that could run it,
@@ -53,7 +53,18 @@ sv_src="$sv_root/src"
 sv_version=${1:?usage: package_macos.sh VERSION}
 sv_identity=${MACOS_SIGN_IDENTITY--}
 sv_installer_identity=${MACOS_INSTALLER_IDENTITY:-}
-sv_target=${MACOSX_DEPLOYMENT_TARGET:-11.0}
+# 14.0 because that is the oldest macOS Apple still issues security patches for
+# (as of August 2026); there is nothing to gain from supporting one that no
+# longer gets them.
+#
+# There is also a HARD floor of 13.3 underneath that choice, which is not free
+# to cross: Accelerate's LAPACK is bound through the new interface, whose
+# symbols (dsytrd$NEWLAPACK and friends) first exist in 13.3.  Built against an
+# older target the binary links, packages, passes the minos gate below, and then
+# dies at launch on the older system with a missing symbol.  Below 13.3 the
+# legacy CLAPACK spelling is required in dn_eig.c as well -- changing one
+# without the other ships a package that cannot run.
+sv_target=${MACOSX_DEPLOYMENT_TARGET:-14.0}
 sv_arch=arm64
 sv_identifier=io.github.rordenlab.svht-denoise
 sv_dist="$sv_root/dist"
@@ -176,7 +187,7 @@ sv_opt="-O3 -arch $sv_arch -mmacosx-version-min=$sv_target"
 # packaged is literally the one the tests passed against. Two invocations would
 # not do that: the flag stamp would no longer match on the second, everything
 # would be rebuilt at the default OPT, and -mmacosx-version-min would vanish --
-# yielding a binary that targets the build machine's macOS rather than the 11.0
+# yielding a binary that targets the build machine's macOS rather than the 14.0
 # this package advertises. (Same trap the ubsan-test targets exist to avoid --
 # see the Makefile.) The minos check below would catch that particular case, but
 # it is the only one it would catch; the invariant worth keeping is that the
@@ -227,6 +238,16 @@ fi
 # dependency, which makes its absence a reliable proof that the fast library is
 # the one actually in the binary -- stronger than the submodule preflight, which
 # only shows the source was available.
+# ...and it must actually have Accelerate in it.  Same shape of proof as the
+# libz one below and for the same reason: `ACCELERATE=0` builds cleanly, passes
+# every other gate, and ships a release that is ~15% slower at large volume
+# counts with nothing about the binary to say which one it is.
+if ! otool -L "$sv_src/$sv_exe" | grep -q 'Accelerate\.framework'; then
+	echo "package_macos.sh: $sv_exe does not link Accelerate, so it was built" >&2
+	echo "  with ACCELERATE=0 and carries the slower built-in reduction." >&2
+	echo "  The build prints which reduction it used; re-run 'make -C src'." >&2
+	exit 1
+fi
 if otool -L "$sv_src/$sv_exe" | awk '/^\t/ { print $1 }' | grep -q 'libz\.'; then
 	echo "package_macos.sh: $sv_exe links libz dynamically, so it was built" >&2
 	echo "  against the system zlib rather than the static zlib-ng." >&2

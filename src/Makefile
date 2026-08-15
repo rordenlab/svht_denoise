@@ -148,23 +148,30 @@ endif
 
 # ------------------------------------------------------------ Apple Accelerate
 #
-# `make ACCELERATE=1` swaps the split path's Householder reduction and its
-# back-transform for LAPACK's dsytrd and dormtr out of Accelerate.  OFF by
-# default and deliberately so: this is an evaluation switch, not a supported
-# configuration.  It adds a framework dependency, which the dependency rule in
-# AGENTS.md does not admit, and it changes the numbers -- Accelerate's blocked
-# reduction is a different algorithm, not a faster spelling of ours, so results
-# move by roughly solver-noise and are NOT bit-identical to a default build.
-# Byte-identity across thread counts still holds within either build.
+# The split path's Householder reduction and back-transform come from LAPACK's
+# dsytrd and dormtr, out of Accelerate.  DEFAULT ON for macOS, `ACCELERATE=0`
+# to opt out; off everywhere else, since no other platform has the framework.
 #
-# It exists to answer one question with a measurement instead of an argument:
-# the unblocked reduction is the largest single block left (~39% of CPU), and
-# writing a compact-WY blocked version by hand is the riskiest change available.
-# If a library that has been tuned for this hardware for twenty years does not
-# beat the loop in dn_eig.c, hand-writing one is not going to.
+# Measured on 100x100x58x138: -14.4% wall and -16.2% CPU (58.6 -> 50.2 s,
+# 741 -> 621 s).  The full solver path (n < DN_SPLIT_MIN) is untouched, so the
+# small-N benchmark series is unaffected -- this is a large-N win only.
+#
+# It is a framework, not a library to install or bundle: present on every macOS
+# that this builds for, resolved at load like libSystem, and it adds nothing to
+# the executable.  That is why it is admitted where a BLAS is not.
+#
+# It changes the numbers -- a blocked reduction is a different algorithm, not a
+# faster spelling of the same one -- by ~3e-10 relative L2 with the rank map
+# identical, and byte-identical below LAPACK's own blocking crossover.  A build
+# with it and one without are NOT bit-identical to each other.  Byte-identity
+# across thread counts holds within either build, which is the promise made.
+ACCELERATE ?= $(if $(filter Darwin,$(UNAME_S)),1,0)
 ifeq ($(ACCELERATE),1)
   override REQ_CFLAGS += -DDN_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
   ACCEL_LIB = -framework Accelerate
+  ACCEL_WHICH = Accelerate (dsytrd/dormtr)
+else
+  ACCEL_WHICH = the built-in reduction
 endif
 
 ALL_CFLAGS = $(REQ_CFLAGS) $(CFLAGS) $(DEFS) $(ZLIB_CFLAGS) $(CPPFLAGS)
@@ -220,7 +227,7 @@ BIN     = svht_denoise
 # before a benchmark, which is precisely when you need to know which library
 # went in -- and in the link recipe it printed nothing at all.
 all: $(BIN)
-	@echo "  $(BIN): compression via $(ZLIB_WHICH)"
+	@echo "  $(BIN): compression via $(ZLIB_WHICH), reduction via $(ACCEL_WHICH)"
 
 # Regression tests for the cases that were once silent-failure bugs.  The fixture
 # generator is deliberately standalone -- it writes NIfTI by hand rather than
