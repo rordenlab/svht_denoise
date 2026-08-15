@@ -1,167 +1,111 @@
 ## Introduction
 
-svht_denoise provides a principled, data-driven approach for noise reduction in multi-volume NIfTI datasets, such as diffusion-weighted MRI. The tool applies Singular Value Decomposition (SVD) over local image patches to identify and truncate noise components using the optimal Singular Value Hard Thresholding (SVHT) framework derived by Gavish and Donoho (2014).
+svht_denoise removes thermal noise from multi-volume NIfTI datasets such as diffusion-weighted MRI. It decomposes local image patches by SVD and truncates the noise components using the optimal Singular Value Hard Thresholding of Gavish and Donoho (2014), so no noise level has to be supplied.
 
-The tool works on magnitude volumes, and on complex data when the phase is also available. Magnitude reconstruction shifts thermal Gaussian noise into a non-Gaussian (Rician / non-central chi) distribution whose mean is not zero, and that noise floor biases exactly the low-SNR voxels denoising is meant to help. Given the phase, `-phase` rotates the complex data onto the real axis first, so the noise stays zero-mean Gaussian and the floor is avoided rather than denoised.
+It works on magnitude volumes, and on complex data when the phase is also available. Magnitude reconstruction pushes Gaussian noise into a Rician distribution with a non-zero mean, and that noise floor biases exactly the low-SNR voxels denoising is meant to help. Given the phase, `-phase` rotates the complex data onto the real axis first, so the noise stays zero-mean Gaussian and the floor is avoided rather than denoised. It can also remove Gibbs ringing (`-degibbs`). The image below shows the b-value 2000 volumes for the 1.5mm [OpenNeuro ds004666](https://openneuro.org/datasets/ds004666/) dataset (the small voxels and high b-values both contribute to the noisy raw images).
 
-<img src=images/anim_compare.gif width="300">
+<img src=images/anim_EDDEN1p5mm.gif width="420">
 
-## Building
+## Usage
 
-Requires a C99 compiler on a POSIX system (macOS, Linux, WSL), plus libm, pthreads and zlib — all standard on those platforms. On macOS the build supplies its own zlib (see below) and takes two hot kernels from Accelerate, so nothing has to be installed for either.
+```
+svht_denoise dwi.nii.gz denoised.nii.gz
+svht_denoise dwi.nii.gz denoised.nii.gz -mask brain.nii.gz -noise sigma.nii.gz
+svht_denoise mag.nii.gz denoised.nii.gz -phase phase.nii.gz
+svht_denoise dwi.nii.gz out.nii.gz -degibbs y
+```
+
+`-help` lists every option. The interface follows MRtrix3 `dwidenoise` wherever the two share a concept, including [patch size](https://mrtrix.readthedocs.io/en/latest/dwi_preprocessing/denoising.html#patch-size).
+
+**Complex data.** Only the phase *scale* matters; any constant offset is removed along with the background phase. The unit is read off the observed range by default, which is correct for any encoding covering a full turn — scanner integers, degrees, cycles, radians — and the convention chosen is reported on stderr. Data that does *not* span a turn is ambiguous and must be declared with `-phaseunits radians|degrees|turns`. **The output is then signed**, because background voxels scatter about zero instead of piling onto the noise floor.
+
+**Gibbs ringing.** `-degibbs y` denoises then removes ringing, which is the order these belong in; `-degibbs o` removes ringing only, and is the one mode that accepts a 3D image. Do not use either for partial Fourier acquisitions. Neither combines with `-mask`: a mask leaves a hard zero edge, and ringing removal would treat that edge as signal, throwing ringing back into the masked region. `-degibbs o` additionally refuses `-noise`, `-rank`, `-phase`, `-real` and `-extent`, which all describe a denoiser it is not running.
+
+## Compiling
+
+Needs a C99 compiler, libm, pthreads and zlib.
 
 ```
 git clone --recursive https://github.com/rordenlab/svht_denoise
 cd svht_denoise/src
 make
-make test     # optional: regression tests, no dependencies
+make test
 ```
 
-`--recursive` fetches [zlib-ng](https://github.com/zlib-ng/zlib-ng), the one bundled dependency, pinned to an exact commit. On macOS `make` builds it and links it statically, which is roughly **3× faster at writing `.nii.gz`** — deflate is the largest serial block in a compressed run — and leaves the binary with no `libz` dependency at all. Reading is unchanged; inflate was never the bottleneck.
-
-Nothing breaks without it. A plain `git clone` leaves the submodule empty, and a build path containing a space — or any character outside letters, digits, dot, underscore and hyphen — defeats zlib-ng's own build; either way the build falls back to the system zlib and prints which one it used, and why:
+`--recursive` fetches [zlib-ng](https://github.com/zlib-ng/zlib-ng), the one bundled dependency, which is ~3× faster at writing `.nii.gz`. It is the default **on macOS only**; elsewhere the system zlib is used unless you ask, since it was measured only on Apple Silicon. Also on macOS, the eigensolver's `dsytrd`/`dormtr` and the patch Gram's `cblas_dsyrk` come from Accelerate, worth -36% CPU. Neither is a library to install, and `make` prints what went in — read that line before trusting a timing.
 
 ```
-make ZLIBNG=0                 # force the system zlib
-make ZLIBNG_ROOT=<dir>        # use a prebuilt ZLIB_COMPAT zlib-ng tree
-git submodule update --init ../third_party/zlib-ng    # from src, after a plain clone
+make ZLIBNG=1               # zlib-ng off macOS, or force it on
+make ZLIBNG=0               # system zlib
+make ZLIBNG_ROOT=<dir>      # a prebuilt ZLIB_COMPAT zlib-ng tree
+make ACCELERATE=0           # portable kernels (the default off macOS)
+make DEGIBBS=0              # omit -degibbs entirely
 ```
 
-Elsewhere the system zlib is the default, since this was measured only on Apple Silicon; `ZLIBNG_ROOT` still works there if you want it.
+After a plain (non-recursive) clone, `git submodule update --init ../third_party/zlib-ng` from `src` populates it; a build path containing anything outside letters, digits, dot, underscore and hyphen also defeats zlib-ng's own build. Either way the build falls back and says why.
 
-On macOS the two hottest kernels come from Apple's [Accelerate](https://developer.apple.com/accelerate/) framework: `cblas_dsyrk` forms the patch Gram matrix, and LAPACK's `dsytrd` and `dormtr` do the eigensolver's Householder reduction and back-transform. Together they are worth **-33% wall clock and -36% CPU** on a 138-volume series — 58.6 s to 39.5 s, 741 s to 474 s of CPU. Accelerate is a system framework rather than a library to install or bundle: present on every macOS the tool targets, resolved at load like libSystem, and it adds nothing to the executable. `make ACCELERATE=0` builds the portable kernels instead, which is what every other platform uses. It costs a little memory — BLAS has no mixed-precision `syrk`, so the per-worker patch buffer is `double` under Accelerate and `float` otherwise, taking peak RSS on that series from 629.8 to 668.1 MiB.
+Accelerate changes the arithmetic slightly (~3e-10 relative L2, identical rank map). Byte-identical output **across thread counts** holds in either build, and `-degibbs` is byte-identical across both.
 
-The two builds do not agree bit for bit. A blocked reduction is a different algorithm rather than a faster spelling of the same one, and moves the output by about 3e-10 in relative L2, with the rank map identical. The `dsyrk` Gram was byte-identical on that series, but only because the input is uint16, so the products and their sums are exactly representable in double; on genuinely fractional input expect drift of the same order as the reduction's. Byte-identical output across thread counts, which is the guarantee this tool actually makes, holds within either build. `make` prints whether Accelerate went in, alongside which zlib.
+## Benchmark
 
-This writes the `svht_denoise` executable into `src`. Run `./svht_denoise -help` for the full list of options.
+Apple M4 Pro (14 cores), macOS 26.6, clang 21, mains power, all 14 threads, writing `.nii.gz`. Wall clock and peak resident set size from `/usr/bin/time -l`.
 
-```
-./svht_denoise dwi.nii.gz denoised.nii.gz
-./svht_denoise dwi.nii.gz denoised.nii.gz -mask brain.nii.gz -noise sigma.nii.gz
-```
+| Dataset                 | method               | Time (s) | Peak RAM (MiB) |
+| ----------------------- | -------------------- | -------- | -------------- |
+| small 100×100×54 × 36   | dwidenoise           | 2.0      | 227            |
+| large 140×140×92 × 297  | dwidenoise           | 1128.4   | 6172           |
+| small 100×100×54 × 36   | svht_denoise         | **1.4**  | **157**        |
+| large 140×140×92 × 297  | svht_denoise         | **549.9**| **4163**       |
+| small 100×100×54 × 36   | mrdegibbs            | 2.9      | 157            |
+| large 140×140×92 × 297  | mrdegibbs            | 116.0    | 4100           |
+| small 100×100×54 × 36   | svht_denoise degibbs | **1.8**  | 160            |
+| large 140×140×92 × 297  | svht_denoise degibbs | **73.3** | 4102           |
 
-## Usage
+On the large series that is **2.05× faster than `dwidenoise` using 2.0 GB less**, and **1.58× faster than `mrdegibbs`**. Both denoisers are given the same already-rotated input, so the rows measure the denoiser rather than the front end; the complex rotation is a shared, untimed NumPy step. `svht_denoise` can do that rotation itself in the same pass (`-phase`), which is how you would really run it.
 
-The `-help` option provides full usage details. In general, this tool behaves similarly to MRtrix dwidenoise and therefore has similar options and considerations. For example with regards to [patch size](https://mrtrix.readthedocs.io/en/latest/dwi_preprocessing/denoising.html#patch-size).
+`svht_denoise` and `dwidenoise` are different estimators, not two spellings of one, so the outputs are not expected to match — `dwidenoise` fits Marchenko-Pastur to estimate sigma, where svht_denoise thresholds directly and never uses a noise level to decide. `-noise` still reports one (sigma = y_med/sqrt(M*mu_beta), the paper's Equation 26), but it is derived after the fact and does not influence the output. `-degibbs` *is* meant to match `mrdegibbs`, and does: relative L2 of 1e-13 to 3e-12 with no voxel differing by more than one float32 ULP, and byte-identical on the test fixture.
 
-## Complex data
+The small dataset ships in [benchmark/](benchmark/): 100×100×54 at 2.2 mm, masked, 36 volumes. The large one is [OpenNeuro ds004666](https://openneuro.org/datasets/ds004666/) (EDDEN, 1.5 mm, magnitude and phase, b up to 3010); [benchmark-large/benchmark_large](benchmark-large/benchmark_large) fetches it, runs both pipelines and writes the animation above. Run it with no argument and it fetches then benchmarks; `benchmark_large fetch` only downloads. The benchmark half runs only on files that are present, so a checkout without the data reports what is missing instead of failing.
 
-Pass the magnitude series as the input and its phase with `-phase`, and the two are rotated onto the real axis before denoising:
-
-```
-./svht_denoise mag.nii.gz denoised.nii.gz -phase phase.nii.gz
-```
-
-The phase must match the magnitude in all four dimensions and share its world transform, which is checked. `-real` writes the rotated series before denoising, if you want to see what the denoiser was given.
-
-Only the phase *scale* has to be right; any constant offset is removed along with the background phase. By default the units are taken from the observed range, and the convention used is reported on stderr (unless `-quiet`) so it can be checked:
-
-| observed | read as |
-| --- | --- |
-| a span within 0.1 of 2π | radians, unchanged, wherever centred |
-| any other span | whatever unit makes that span one turn |
-| constant | a constant rotation, removed whatever its scale |
-
-The middle row is the rule the reference implementation uses, and it is correct for **any** encoding that covers a whole turn — scanner integers (Siemens writes -4096..4094), degrees, cycles, [-1, 1] — without needing to know which of them it is. Every acquired phase image covers a turn, because its background is noise whose phase is uniform over the circle.
-
-It is wrong for data that does *not* cover a turn, and no amount of cleverness fixes that: a range of [-0.5, 0.5] is either half a radian or one whole cycle, and nothing in the file says which. For that case, say so — `-phaseunits radians|degrees|turns` (`cycles` is a synonym for `turns`; `auto` is the default) skips the inference entirely:
-
-```
-./svht_denoise mag.nii.gz denoised.nii.gz -phase phase.nii.gz -phaseunits radians
-```
-
-The rotation removes the per-voxel static background phase, taken from the first volume whose mean magnitude reaches 95% of the largest (a b=0 image in a diffusion series), then removes the residual per-slice, per-volume phase left by bulk motion, estimated by low-pass filtering the complex image in plane. The real part is kept. This is the "MPPCA\*" preprocessing of Manzano Patron et al. (2024), and the rotation itself is the phase-removal front end of NORDIC (Moeller et al., 2021), specified by `NIFTI_COMP_to_REAL.m`. No phase unwrapping is involved anywhere: every rotation is computed as `conj(z)/|z|` straight from the complex value, so wrapped angles never arise.
-
-**The output is then signed.** Background voxels scatter about zero instead of piling up on the noise floor, which is the entire point, but it means the result is no longer a magnitude image. On the sample data in [edden/](edden/) the rotation takes the background mean from 70.0 to 43.8, makes 22% of background voxels negative, and raises the background standard deviation from 78.4 to 81.7. Those figures are the *rotated series*, what `-real` writes; after denoising, the same background reads 43.4, 3.2% negative, standard deviation 71.1. The rise in spread is expected rather than a regression — magnitude reconstruction rectifies noise onto the positive half-line, and undoing that returns the signed channel's own scatter.
-
-That residual +43.8 is not a bug and is not removable by this method: the phase estimate is derived from the data, so each noise sample is partly rotated onto the alignment of its own neighbourhood. The reference MRtrix3 pipeline leaves the same bias — 43.6 against 43.8 on the rotated series, and 43.37 against 43.41 after denoising.
-
-The rotation is serial, so it adds about 0.37 s of wall clock to a 2.1 s run (~18%) while being only ~2.7% of total CPU time — the gap between those two figures is why a single wall-clock sample badly misjudges it. It costs rather more memory: a float32 copy of the phase series plus a fixed set of 3D scratch volumes, taking peak RSS on the sample data from 127 to 211 MiB.
-
-## macOS release packages
-
-A signed, notarized, stapled installer can be built from `src`. It installs an Apple Silicon (arm64) binary into `/usr/local/bin`, targets macOS 14 or newer, and links only against libSystem and Accelerate — zlib-ng is embedded statically, so there is no `libz` dependency. `MACOSX_DEPLOYMENT_TARGET` sets that minimum, and must not go below 13.3: Accelerate's new LAPACK symbols first exist there, and a binary built against an older target links, packages and passes every check, then dies at launch with a missing symbol. The packaging script refuses to build without the zlib-ng submodule, and separately proves the static link happened by checking that the finished binary does not name `libz` at all; the system-zlib fallback that is right for a working copy would otherwise ship silently, being ~3× slower with nothing about the binary to say so.
-
-Releases are arm64 only. This is a compute-bound tool, and the Intel Macs a universal build would have served are the slowest machines that could run it — on a platform macOS 26 is the last release to support. Building from source on an Intel Mac is unaffected: a plain `make` produces a native binary there as it always did. Cutting a *release* does require an Apple Silicon host, because the packaging script runs the test suite against the arm64 binary it builds; it says so and stops before building if run elsewhere. The installer itself declares `hostArchitectures="arm64"`, so an Intel Mac refuses it rather than installing a binary that cannot run.
-
-Store the notarization credentials once per machine — this prompts for an [app-specific password](https://appleid.apple.com), not your Apple ID password:
-
-```
-make macos-notary-profile APPLE_ID='you@example.com' TEAM_ID='ABCDE12345'
-```
-
-Then build a release. Two *different* certificates are needed, both from the same developer account: "Developer ID Application" signs the executable, "Developer ID Installer" signs the `.pkg`.
-
-```
-make macos-release \
-  VERSION=0.1.20260808 \
-  MACOS_SIGN_IDENTITY='Developer ID Application: Your Name (ABCDE12345)' \
-  MACOS_INSTALLER_IDENTITY='Developer ID Installer: Your Name (ABCDE12345)'
-```
-
-That checks the credentials actually authenticate before doing any work, then builds, runs the full test suite, signs, packages, notarizes, staples and verifies — writing to `dist/`. The binary that ships is the one the tests ran against: the build and the suite happen in a single `make` invocation, so a stale or differently-configured binary cannot be substituted between them. With a single arm64 slice, the suite exercises exactly the code that ships — the universal build could only ever test the host slice and signed the other one unexecuted. `security find-identity -v` lists your identities.
-
-For local testing without certificates, `make macos-pkg-adhoc` produces an unsigned package; Gatekeeper will refuse it on another machine. `scripts/verify_macos_pkg.sh <pkg>` checks a package without installing it — signature, that nothing outside `/usr/lib` and `/System` is linked, and that the binary runs; it reports the architectures rather than asserting them, since the arm64-only gate runs in `package_macos.sh` before anything is signed. That last check *runs* the packaged executable, so use it on packages you built, not on one from an untrusted source.
-
-## Licensing
-
-The underlying algorithm for optimal singular value hard thresholding (SVHT) is based on the work of Gavish and Donoho (2014).
-
- - Algorithm & Theory: The method computes the unknown-noise-level threshold of Equation 4, tau = omega(beta) * y_med, where omega(beta) = lambda_star(beta) / sqrt(mu_beta) is assembled from the closed form of Equation 11 and an exactly bisected Marchenko-Pastur median, rather than from the cubic approximation to omega given in Equation 5. While reference MATLAB scripts for the method were distributed under GPL-3.0, this project is an independent clean-room C implementation built directly from the paper's mathematical formulations rather than derived from the original reference code.
- - CLI Design: The command-line interface, flag names, and operational parameters were intentionally structured to follow the conventions of dwidenoise from MRtrix3 wherever the two tools share a concept (`-mask`, `-noise`, `-extent`, `-nthreads`, `-quiet`). No code from MRtrix3 was incorporated.
- - Complex Data: The `-phase` front end implements the real-axis rotation that Manzano Patron et al. (2024) [PMID: 40800437](https://pubmed.ncbi.nlm.nih.gov/40800437/) apply before MPPCA, and which originates as the phase-removal stage of NORDIC (Moeller et al., NeuroImage 226:117539, 2021). Steen Moeller's MATLAB `NIFTI_COMP_to_REAL.m` was read as a specification of the method; no code was translated from it, and the two deliberate divergences, along with the derivation that replaces its per-slice FFTs with a 7-tap convolution, are recorded at the head of `dn_phase.c`. The convention of reading the phase units off the observed data range follows [niimath](https://github.com/rordenlab/niimath) (BSD-2-Clause), whose `medic.c` does the same.
- - AI Assistance: Generative AI tools were used during translation and refactoring.
- - Prior Work: Applying random matrix theory to denoise diffusion MRI was established by Veraart, Novikov, Fieremans and colleagues (2016), whose [dwidenoise](https://mrtrix.readthedocs.io/en/dev/reference/commands/dwidenoise.html) remains the reference implementation and the benchmark this tool is measured against. svht_denoise is an independent implementation of a different estimator, and shares no code with it: dwidenoise fits the Marchenko-Pastur distribution to the patch eigenspectrum to estimate the noise level sigma, which then sets the cutoff, whereas svht_denoise applies the Gavish and Donoho hard threshold directly, at omega(beta) times the median singular value, so the noise level never enters the retain-or-discard decision. An estimate is still available on request: the optional `-noise` map reports sigma = y_med / sqrt(M * mu_beta), Equation 26 of the paper, but it is derived after the fact and does not influence the denoised output.
-
-This executable and its source code are licensed under the Mozilla Public License 2.0 (MPL-2.0), matching the permissive license used by the core MRtrix3 codebase. Note that dwidenoise itself is not covered by that permissive license: it carries an additional notice from New York University and the University of Antwerp restricting it to non-commercial research and excluding clinical care. svht_denoise carries no such restriction.
-
-The macOS release binary statically embeds [zlib-ng](https://github.com/zlib-ng/zlib-ng), © 1995-2024 Jean-loup Gailly and Mark Adler, under the zlib licence — permissive and compatible with MPL-2.0 §3.3. Its text is in [packaging/LICENSE-zlib-ng.txt](packaging/LICENSE-zlib-ng.txt). A `make ZLIBNG=0` build links the system zlib instead and embeds nothing.
-
-## Benchmarking
-
-A sample diffusion dataset is provided to evaluate the time and peak memory required to process a provided diffusion scan. This demonstrates that the performance on these metrics is similar to [dwidenoise](https://mrtrix.readthedocs.io/en/dev/reference/commands/dwidenoise.html). However, note these are different algorithms and the outputs are not expected to be identical. Further, the input image is intentionally small to minimize the size of this repository: 100x100x54 voxels at 2.2mm isotropic resolution, masked, with 36 volumes (a b=0 image, 30 half-sphere b=2000 directions, and five trailing b=0 images).
-
-Run these from `src`, after `mkdir -p ../benchmark/svht_denoise ../benchmark/dwidenoise`:
-
-```
-/usr/bin/time -l ./svht_denoise ../benchmark/input/dwi.nii.gz ../benchmark/svht_denoise/dwi.nii.gz
-/usr/bin/time -l ./svht_denoise ../benchmark/input/dwi.nii.gz ../benchmark/svht_denoise/dwi1.nii.gz -nthreads 1
-/usr/bin/time -l dwidenoise ../benchmark/input/dwi.nii.gz ../benchmark/dwidenoise/dwi.nii.gz
-/usr/bin/time -l dwidenoise ../benchmark/input/dwi.nii.gz ../benchmark/dwidenoise/dwi1.nii.gz -nthreads 1
-```
-
-And, from the repository root, with a Python environment that has DIPY (`mkdir -p benchmark/dipy` first):
-
-```
-/usr/bin/time -l python3 benchmark/dipy_mppca.py benchmark/input/dwi.nii.gz benchmark/dipy/dwi.nii.gz
-```
-
-Here are findings for an Apple MacBook with M4 Pro CPU (14 core, 10 performance). Time is elapsed wall clock, and peak RAM is the maximum resident set size, both as reported by `/usr/bin/time -l`.
-
-All five rows were measured in ONE sitting, round-robin across the configurations so thermal drift could not favour whichever tool ran last: median of five runs each, three for DIPY. The `svht_denoise` rows are the default macOS build with the bundled static zlib-ng — since which zlib went in changes the wall clock and nothing else, a timing is only comparable to another taken with the same one, and `make` prints which it used.
-
-The `dwidenoise` and `dipy` rows are the control. They are unchanged code, and re-measuring them reproduced their previous figures to within 0.5-2.2% (1950 → 1960, 11620 → 11880, 59590 → 60760), which is what says the sitting is trustworthy rather than merely self-consistent.
-
-zlib-ng is worth more once the denoise is spread across cores, because compression is serial either way: it took ~430 ms off the 14-thread run and only ~650 ms off the single-threaded one, which is a 21% saving against 4%.
-
-The `dipy mppca` row is DIPY 1.11.0 on Python 3.12 (NumPy 2.1.3), median of three runs, at `patch_radius=2` — a 5x5x5 window, the same patch the other two use here. It has no thread option and uses one core (user time equals wall clock), so there is no 14-thread row for it; the figure is whole-process, of which interpreter startup and imports are 0.3 s. It is the closest algorithmic comparison to `dwidenoise` rather than to this tool: both are Marchenko-Pastur PCA, and svht_denoise is a different estimator. The memory is the more interesting column — DIPY works in float64 on the whole series, where the two C tools stream float32.
-
-| Method       | Threads | Time (ms) | Peak RAM (MiB) |
-| ------------ | ------- | --------- | ------------- |
-| svht_denoise |      14 |      1270 |           152 |
-| svht_denoise |       1 |     10970 |           151 |
-| dwidenoise   |      14 |      1960 |           227 |
-| dwidenoise   |       1 |     11880 |           226 |
-| dipy mppca   |       1 |     60760 |           844 |
-
-A round of internal optimisation moved the `svht_denoise` rows and nothing else: 1650 → 1270 ms at 14 threads and 14100 → 10970 ms single-threaded, both about -23%, at unchanged memory. The single-threaded row is the one that changed character — it was slower than `dwidenoise` and is now faster.
-
-The saving grows with the series. On a 100x100x58 series of 138 volumes at 7x7x7 (not in this repository, same 14 threads, mains power, median of five alternating rounds) the same change reads 94.66 s to 58.67 s of wall clock (-38%) and 1220.96 s to 726.46 s of CPU (-40%), peak RSS 778.1 to 775.5 MiB. Nothing about the interface or the output format changed. One of those changes does move values — a local `hypot` in the eigensolver's QL inner loop — at 2.24e-10 relative L2 error on that series, with the rank map byte-identical.
-
-`scripts/bench.sh <input> <output> <binary>...` produced those figures. It alternates candidates and reverses their order every other round so neither sits in the same thermal position twice, reports the median of the rounds, and refuses to time at all on a loaded machine, on battery, or in Low Power Mode — battery alone was measured at 2x, and nothing in the numbers afterwards says which state a timing was taken in.
+One caveat on the degibbs rows: this binary links zlib-ng while MRtrix3 links the system zlib, so a compressed write flatters us by ~1.3× that is not the kernel's doing — uncompressed and alternated, `-degibbs o` is 1.52× `mrdegibbs` on CPU at 104² and 1.36× at 140². `scripts/bench.sh` alternates candidates, reverses their order each round, takes a median, and refuses to time on a loaded machine, on battery, or in Low Power Mode.
 
 ## Links
 
- - [Gavish and Donoho](https://ieeexplore.ieee.org/document/6846297) describe the singular value hard thresholding method. The pre-print [arxiv.1305.5870v3](https://arxiv.org/abs/1305.5870) is included with this repository.
- - [dwidenoise](https://mrtrix.readthedocs.io/en/dev/reference/commands/dwidenoise.html) is a popular and robust open source tool for de-noising diffusion images. It is based on Veraart et al. (2016) works [PMID:27523449](https://pubmed.ncbi.nlm.nih.gov/27523449/) and [PMID:26599599](https://pubmed.ncbi.nlm.nih.gov/26599599/). Note that it is restricted to non-commercial research usage.
- - [dwidenoise2](https://github.com/Lestropie/dwidenoise2) uses a novel method for de-noising, albeit it is also restricted to non-commercial usage.
+**Method**
+
+- Gavish M, Donoho DL. The optimal hard threshold for singular values is 4/√3. *IEEE Trans Inf Theory* 2014;60(8):5040-5053. [DOI](https://ieeexplore.ieee.org/document/6846297) — the threshold implemented here; the [preprint](https://arxiv.org/abs/1305.5870) is bundled with this repository.
+- Veraart J, Novikov DS, Christiaens D, Ades-Aron B, Sijbers J, Fieremans E. Denoising of diffusion MRI using random matrix theory. *NeuroImage* 2016;142:394-406. [PMID 27523449](https://pubmed.ncbi.nlm.nih.gov/27523449/) — MPPCA, the reference approach.
+- Kellner E, Dhital B, Kiselev VG, Reisert M. Gibbs-ringing artifact removal based on local subvoxel-shifts. *Magn Reson Med* 2016;76:1574-1581. — the `-degibbs` method.
+- Moeller S, Pisharady PK, Ramanna S, et al. NOise reduction with DIstribution Corrected (NORDIC) PCA. *NeuroImage* 2021;226:117539. — origin of the phase rotation.
+- Manzano Patron JP, Moeller S, Andersson JLR, et al. Denoising diffusion MRI: considerations and implications for analysis. *Imaging Neuroscience* 2024. [PMID 40800437](https://pubmed.ncbi.nlm.nih.gov/40800437/) — the "MPPCA\*" pipeline `-phase` reproduces. Datasets, scripts and methods to quantify performance.
+ 
+**Software**
+
+- [MRtrix3](https://www.mrtrix.org/) — [dwidenoise](https://mrtrix.readthedocs.io/en/dev/reference/commands/dwidenoise.html) and [mrdegibbs](https://mrtrix.readthedocs.io/en/dev/reference/commands/mrdegibbs.html), the reference implementations benchmarked here. Note `dwidenoise` is restricted to non-commercial research use.
+- [dwidenoise2](https://github.com/Lestropie/dwidenoise2) — a newer method, also non-commercial only.
+- [DIPY](https://dipy.org/) — `benchmark/dipy_mppca.py` runs its MPPCA for comparison.
+- [niimath](https://github.com/rordenlab/niimath) — renders the animation frames.
+- [zlib-ng](https://github.com/zlib-ng/zlib-ng) — bundled, for faster `.nii.gz` writing.
+- [OpenNeuro ds004666](https://openneuro.org/datasets/ds004666/) — the large benchmark dataset.
+
+## Licensing
+
+MPL-2.0, matching the core MRtrix3 codebase. Unlike `dwidenoise`, which carries an additional NYU/Antwerp notice restricting it to non-commercial research, svht_denoise has no such restriction.
+
+- **Algorithm.** An independent clean-room C implementation from the Gavish and Donoho paper's formulations — Equation 4's threshold with Equation 11's closed form and an exactly bisected Marchenko-Pastur median — not derived from its GPL-3.0 reference MATLAB.
+- **CLI.** Flag names follow `dwidenoise` conventions. No MRtrix3 code is in the denoiser.
+- **Gibbs ringing.** `src/mrdegibbs/dg.c` **is adapted from** MRtrix3's `cmd/mrdegibbs.cpp`, by Ben Jeurissen and J-Donald Tournier, © 2008-2025 the MRtrix3 contributors, MPL-2.0. The `-axes` option is not carried over.
+- **FFT.** `src/mrdegibbs/dg_fft.c` **is adapted from** Eigen's `unsupported/Eigen/src/FFT/ei_kissfft_impl.h`, © 2009 Mark Borgerding, and MPL-2.0 as distributed by Eigen. It derives in turn from [kissfft](https://github.com/mborgerding/kissfft), © 2003-2009 Mark Borgerding, which upstream is BSD-3-Clause. It is the same transform `mrdegibbs` reaches through `Eigen::FFT`; MRtrix3 links neither FFTW nor a BLAS.
+- **Complex data.** The rotation follows NORDIC's phase-removal stage, with Steen Moeller's `NIFTI_COMP_to_REAL.m` read as a specification; no code was translated. Reading phase units off the data range follows [niimath](https://github.com/rordenlab/niimath) (BSD-2-Clause).
+- **zlib-ng** © 1995-2024 Jean-loup Gailly and Mark Adler, zlib licence ([text](packaging/LICENSE-zlib-ng.txt)), statically linked into every macOS build (`ZLIBNG=0` links the system zlib and embeds nothing).
+- **NIfTI I/O.** `src/nifti_io.c` is vendored public-domain code by Robert W Cox, Mark Jenkinson, Rick Reynolds and Chris Rorden, via [niimath](https://github.com/rordenlab/niimath). It is the largest third-party component here and is not modified.
+- **AI assistance.** Generative AI tools were used during translation and refactoring.
+
+The phase rotation's two deliberate divergences and its 7-tap convolution derivation are documented at the head of `src/dn_phase.c`; the degibbs design record is at the head of `src/mrdegibbs/dg.c`.
+
+## macOS release packages
+
+`make macos-release VERSION=<tag>` builds a signed, notarized, stapled arm64 installer targeting macOS 14 or newer, into `dist/`. It needs two certificates from one developer account — "Developer ID Application" for the executable and "Developer ID Installer" for the `.pkg` — plus credentials stored once with `make macos-notary-profile APPLE_ID=... TEAM_ID=...` (which prompts for an [app-specific password](https://appleid.apple.com), not your Apple ID password).
+
+Releases are arm64 only, and `MACOSX_DEPLOYMENT_TARGET` must not go below 13.3, where Accelerate's new LAPACK symbols first exist. `make macos-pkg-adhoc` builds an unsigned package for local testing; `scripts/verify_macos_pkg.sh <pkg>` inspects one without installing it — note it *runs* the packaged executable, so use it on packages you built, not on one from an untrusted source. The Makefile's release section has the detail.
+

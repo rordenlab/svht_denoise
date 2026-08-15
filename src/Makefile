@@ -42,6 +42,11 @@ endif
 # just performance.
 # User CPPFLAGS is appended after DEFS, so it can add but not remove.
 #
+# -I. is in REQ_CFLAGS because sources in a SUBDIRECTORY (mrdegibbs/) include
+# headers from here; a quoted include resolves relative to the including file
+# first, which is not this directory.  The flat `%.o: %.c` rule below already
+# matches a subdirectory target, so no second pattern rule is needed.
+#
 # This is a plain `=`, NOT `?=`, and that is load-bearing.  make imports
 # environment variables as already-defined, so with `?=` a developer or CI with
 # CFLAGS in their shell profile silently won the assignment -- and because the
@@ -52,7 +57,7 @@ endif
 # command-line `make CFLAGS=...`, which is the override that was actually
 # intended.
 CFLAGS    = $(OPT) $(WARN)
-override REQ_CFLAGS = $(STD)
+override REQ_CFLAGS = $(STD) -I.
 
 # ------------------------------------------------------------------ zlib-ng
 #
@@ -184,6 +189,32 @@ else
   ACCEL_WHICH = the built-in reduction
 endif
 
+# ---------------------------------------------------------------- degibbs
+#
+# Gibbs ringing removal (`-degibbs`), adapted from MRtrix3's mrdegibbs.  ON by
+# default, and it costs nothing to carry: dg_fft.c brings its own transform, so
+# there is no BLAS, no Accelerate and no new library on the link line -- only
+# about 350 lines of C that nothing else touches.  Compiling it in does NOT turn
+# it on: the runtime default is `-degibbs n`, so a plain run still denoises and
+# nothing else.
+#
+#   make DEGIBBS=0             build without -degibbs at all
+#
+# Same hard error on any other value that ZLIBNG and ACCELERATE get, for the same
+# reason: `DEGIBBS=no` would otherwise build WITH the option while the author
+# believed otherwise, and only one line of output would say so.
+DEGIBBS ?= 1
+ifeq ($(filter 0 1,$(DEGIBBS)),)
+  $(error DEGIBBS must be 0 or 1 (got '$(DEGIBBS)'))
+endif
+ifeq ($(DEGIBBS),1)
+  override REQ_CFLAGS += -DDN_DEGIBBS
+  DEGIBBS_OBJS = mrdegibbs/dg.o mrdegibbs/dg_fft.o
+  DEGIBBS_WHICH = with -degibbs
+else
+  DEGIBBS_WHICH = without -degibbs
+endif
+
 ALL_CFLAGS = $(REQ_CFLAGS) $(CFLAGS) $(DEFS) $(ZLIB_CFLAGS) $(CPPFLAGS)
 LDLIBS   = -lm $(ZLIB_LIB) -lpthread $(ACCEL_LIB)
 
@@ -203,7 +234,8 @@ NIFTI_CFLAGS = $(REQ_CFLAGS) $(OPT) -w $(DEFS) $(ZLIB_CFLAGS) $(CPPFLAGS)
 # become the default goal; say what the default is instead of relying on order.
 .DEFAULT_GOAL := all
 
-OBJS  = dn.o dn_coef.o dn_lambda_star.o dn_eig.o dn_patch.o dn_nii.o dn_phase.o dn_run.o
+OBJS  = dn.o dn_coef.o dn_lambda_star.o dn_eig.o dn_patch.o dn_nii.o dn_phase.o dn_run.o \
+        $(DEGIBBS_OBJS)
 MAIN  = svht_denoise.o
 NIFTI = nifti_io.o
 
@@ -237,7 +269,7 @@ CURFLAGS  := $(CC) $(ALL_CFLAGS) $(LDLIBS)
 # open under -j.  A MISSING object cannot be mis-dated, which is why deleting
 # beats any amount of dependency ordering here.
 ifneq ($(strip $(CURFLAGS)),$(strip $(shell cat $(FLAGSTAMP) 2>/dev/null)))
-  $(shell rm -f *.o svht_denoise dn_testgen)
+  $(shell rm -f *.o mrdegibbs/*.o svht_denoise dn_testgen)
 endif
 .PHONY: force
 force: ;
@@ -257,7 +289,7 @@ BIN     = svht_denoise
 # before a benchmark, which is precisely when you need to know which library
 # went in -- and in the link recipe it printed nothing at all.
 all: $(BIN)
-	@echo "  $(BIN): compression via $(ZLIB_WHICH), reduction via $(ACCEL_WHICH)"
+	@echo "  $(BIN): compression via $(ZLIB_WHICH), reduction via $(ACCEL_WHICH), built $(DEGIBBS_WHICH)"
 
 # Regression tests for the cases that were once silent-failure bugs.  The fixture
 # generator is deliberately standalone -- it writes NIfTI by hand rather than
@@ -381,7 +413,7 @@ verbose:
 # `$(DN_VERSION_H)` is frozen as those nine literal characters and the release
 # ships an empty version.  Keeping the number here is the safe half of that
 # trade; bump both when it changes.
-VERSION ?= 0.1.20260808
+VERSION ?= 0.1.20260813
 MACOS_SIGN_IDENTITY ?=
 MACOS_INSTALLER_IDENTITY ?=
 NOTARY_PROFILE ?= svht-denoise-notary
@@ -481,7 +513,7 @@ check-notary-profile:
 # executable whose own minos still reads 11.0, so the package check passes and
 # nothing fails.  Rebuilding it costs a couple of seconds.
 clean:
-	rm -f *.o *.d $(BIN) $(TESTGEN) $(FLAGSTAMP)
+	rm -f *.o *.d mrdegibbs/*.o mrdegibbs/*.d $(BIN) $(TESTGEN) $(FLAGSTAMP)
 	rm -rf $(ZNG_BUILD) $(ZNG_REV)
 
 # Debug builds leave a .dSYM bundle beside the binary; sweep it too.

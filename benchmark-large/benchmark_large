@@ -1,0 +1,141 @@
+#!/bin/sh
+# Populate and benchmark the large dataset (OpenNeuro ds004666, EDDEN 1.5 mm).
+#
+#   ./benchmark_large            fetch if absent, then benchmark whatever is present
+#   ./benchmark_large fetch      fetch only
+#
+# Layout mirrors ../benchmark: raw data in dwi/, results in mrtrix/ and
+# svht_denoise/.  Every stage skips if its output already exists, so an
+# interrupted run resumes and a re-run costs nothing.
+#
+# BOTH DENOISERS ARE GIVEN THE SAME ALREADY-ROTATED INPUT (mrtrix/real.nii.gz),
+# so the two rows measure the denoiser and not the front end.  svht_denoise can
+# do the complex rotation itself in the same pass -- `-phase` -- and that is how
+# you would really run it; timing it that way instead would fold a stage into one
+# arm that the other does in NumPy beforehand, which is not a comparison.
+#
+# Needs: aws CLI (fetch only), mrtrix3 (dwidenoise, mrdegibbs) and niimath on
+# PATH, python3 with numpy + nibabel (rotation) + Pillow (animation).
+
+set -u
+cd "$(dirname -- "$0")" || exit 1
+case $(pwd) in */benchmark-large) ;; *) echo "run this from the repo, not via PATH" >&2; exit 2;; esac
+ROOT=$(cd .. && pwd)
+BIN=$ROOT/src/svht_denoise
+
+DATASET=ds004666
+S3=s3://openneuro.org/$DATASET/sub-01/ses-1p5mm/dwi
+STEM=sub-01_ses-1p5mm_dir-AP
+MAG=dwi/${STEM}_run-01_part-mag_dwi.nii.gz
+PHA=dwi/${STEM}_run-01_part-phase_dwi.nii.gz
+BVAL=dwi/${STEM}_dwi.bval
+TIMINGS=timings.tsv
+PART=
+
+fetch() {
+	mkdir -p dwi || exit 1
+	command -v aws >/dev/null || {
+		echo "aws CLI not found; install it or copy the four files into dwi/ by hand:" >&2
+		echo "  https://openneuro.org/datasets/$DATASET" >&2
+		exit 2
+	}
+	for f in ${STEM}_dwi.bval ${STEM}_dwi.bvec \
+	         ${STEM}_run-01_part-mag_dwi.nii.gz ${STEM}_run-01_part-phase_dwi.nii.gz; do
+		[ -s "dwi/$f" ] && { echo "  have $f"; continue; }
+		echo "  fetching $f"
+		aws s3 cp "$S3/$f" dwi/ --no-sign-request || exit 1
+	done
+}
+
+# time_it <label> <output> <command...>
+#
+# The command must write to $PART, which time_it sets from <output> BEFORE the
+# arguments are expanded -- callers spell it "$PART" and it lands as
+# name.part.nii.gz.  The suffix goes in the MIDDLE, not on the end: MRtrix infers
+# format from the extension and rejects "denoised.nii.gz.part" outright, and
+# nifti_io would quietly pick a different format for it.
+#
+# The temporary exists because a bare existence test cannot tell a finished
+# output from one interrupted mid-write: both tools stream .nii.gz to disk, so a
+# Ctrl-C leaves a truncated NON-EMPTY file that a later run would skip, then
+# benchmark and animate as if it were complete.  Records into $TIMINGS keyed by
+# label, so a resumed run keeps the rows it already has.
+time_it() {
+	label=$1; out=$2; shift 2
+	if [ -s "$out" ]; then
+		echo "  skip $label (have $out)"
+		return 0
+	fi
+	echo "  running $label"
+	rm -f "$PART"
+	/usr/bin/time -l "$@" >/dev/null 2>tmp.time || {
+		echo "  FAILED: $label" >&2; sed 's/^/    /' tmp.time >&2; rm -f tmp.time "$PART"; return 1; }
+	mv -f "$PART" "$out" || { rm -f tmp.time; return 1; }
+	# BSD time: "real" on one line, peak RSS in bytes on its own.
+	awk -v l="$label" '
+		$2 == "real" { w = $1 }
+		/maximum resident set size/ { r = $1 / 1048576 }
+		END { if (w == "" || r == "") exit 1; printf "%s\t%.1f\t%.0f\n", l, w, r }
+	' tmp.time >>"$TIMINGS" || echo "  (could not parse timing for $label)" >&2
+	rm -f tmp.time
+}
+
+[ "${1:-}" = fetch ] && { fetch; exit 0; }
+[ -s "$MAG" ] || fetch
+
+missing=
+for f in "$MAG" "$PHA" "$BVAL"; do [ -s "$f" ] || missing="$missing $f"; done
+if [ -n "$missing" ]; then
+	echo "not benchmarking; missing:$missing"
+	echo "run './benchmark_large fetch' to populate dwi/"
+	exit 0
+fi
+[ -x "$BIN" ] || { echo "build it first: (cd $ROOT/src && make)" >&2; exit 2; }
+
+mkdir -p mrtrix svht_denoise
+[ -f "$TIMINGS" ] || : >"$TIMINGS"
+
+# The rotation is the shared front end and is NOT timed: it is single-threaded
+# NumPy, the same for both arms, and neither tool's doing.
+if [ ! -s mrtrix/real.nii.gz ]; then
+	echo "rotating complex -> real (python, not timed)"
+	python3 mrtrix.py "$MAG" "$PHA" mrtrix --rotate-only || exit 1
+fi
+REAL=mrtrix/real.nii.gz
+
+echo "denoise (both on $REAL):"
+PART=mrtrix/denoised.part.nii.gz
+time_it "dwidenoise"   mrtrix/denoised.nii.gz \
+	dwidenoise "$REAL" "$PART" -noise mrtrix/noise.nii.gz -quiet -force
+PART=svht_denoise/denoised.part.nii.gz
+time_it "svht_denoise" svht_denoise/denoised.nii.gz \
+	"$BIN" "$REAL" "$PART" -noise svht_denoise/noise.nii.gz -quiet
+
+echo "degibbs (each on its own denoised series):"
+PART=mrtrix/degibbs.part.nii.gz
+time_it "mrdegibbs"            mrtrix/degibbs.nii.gz \
+	mrdegibbs mrtrix/denoised.nii.gz "$PART" -quiet -force
+PART=svht_denoise/degibbs.part.nii.gz
+time_it "svht_denoise degibbs" svht_denoise/degibbs.nii.gz \
+	"$BIN" svht_denoise/denoised.nii.gz "$PART" -degibbs o -quiet
+
+echo
+printf '%-24s %10s %14s\n' method "Time (s)" "Peak RAM (MiB)"
+printf '%-24s %10s %14s\n' ------------------------ ---------- --------------
+while IFS='	' read -r l w r; do printf '%-24s %10s %14s\n' "$l" "$w" "$r"; done <"$TIMINGS"
+
+# b > 1500 only: the low shells show little and 297 frames is unwatchable.
+# Lands HERE, untracked, at ~7 MB.  The copy README embeds lives in images/ and is
+# hand-compressed to ~2.4 MB; writing there would silently replace it with this.
+ANIM=anim_EDDEN1p5mm.gif
+if [ -s svht_denoise/denoised.nii.gz ] && [ -s mrtrix/denoised.nii.gz ]; then
+	echo
+	echo "animation -> $ANIM"
+	python3 "$ROOT/tools/make_anim.py" -b . --minb 1500 -s 0.45 -d 150 --bval "$BVAL" \
+		-R "mrtrix/real.nii.gz=input (complex, rotated to real)" \
+		-R "mrtrix/denoised.nii.gz=MRtrix3 MPPCA*" \
+		-R "svht_denoise/denoised.nii.gz=svht_denoise" \
+		"$ANIM"
+else
+	echo "(animation needs both denoised series)"
+fi

@@ -1,9 +1,9 @@
 // whole-volume driver and worker pool.
 //
 // The pool is POSIX threads only, by design: the default build has no threading
-// dependency to install.  Everything platform-specific is confined to this file,
-// so a future Windows port replaces this one translation unit and leaves the
-// kernel untouched.
+// dependency to install.  The launch and join themselves live in dn.c's
+// dn_thread_run, shared with mrdegibbs/dg.c, so a future Windows port replaces
+// that helper plus each pool's mutex rather than this file alone.
 //
 // SCHEDULING AND DETERMINISM.  Work is handed out in chunks from a shared
 // counter rather than partitioned statically up front.  That is safe for the
@@ -185,33 +185,7 @@ int dn_run_execute(const dn_run *r) {
 		return 1;
 	}
 
-	// One thread means no thread: keeps -nthreads 1 usable under a debugger and
-	// makes the serial path the obvious reference for the byte-identity gate.
-	if (nthreads == 1) {
-		worker(&pool);
-	} else {
-		pthread_t *tid = (pthread_t *)dn_malloc((size_t)nthreads, sizeof(pthread_t));
-		if (!tid) { pthread_mutex_destroy(&pool.lock); return 1; }
-		int started = 0;
-		for (int i = 0; i < nthreads; i++) {
-			if (pthread_create(&tid[i], NULL, worker, &pool) != 0) break;
-			started++;
-		}
-		if (started == 0) {
-			// Fall back to running inline rather than failing the whole job.
-			dn_err("could not start any worker thread; running single-threaded\n");
-			worker(&pool);
-		} else if (started < nthreads) {
-			// Partial creation used to continue silently, so the count the CLI
-			// had already printed could overstate the team that actually ran.
-			// The result is still correct -- the remaining workers drain the
-			// whole queue -- but the reported number must not be a fiction.
-			dn_err("only %d of %d worker threads could be started; continuing with %d\n",
-			       started, nthreads, started);
-		}
-		for (int i = 0; i < started; i++) pthread_join(tid[i], NULL);
-		free(tid);
-	}
+	dn_thread_run(worker, &pool, nthreads);
 
 	pthread_mutex_destroy(&pool.lock);
 

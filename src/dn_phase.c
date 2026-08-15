@@ -31,8 +31,10 @@
 //
 //   b) The reference estimates the dynamic phase with a per-slice, per-volume
 //      2D FFT pair, multiplying k-space by a separable tukeywin(N,1)^3 window.
-//      That is done here as a 7-tap convolution instead, with NO FFT anywhere in
-//      this tool.  The two are the same operation:
+//      That is done here as a 7-tap convolution instead, with no FFT on the
+//      phase path and no FFT LIBRARY linked anywhere.  (-degibbs does bundle a
+//      transform, in mrdegibbs/dg_fft.c; nothing here calls it.)  The two are
+//      the same operation:
 //
 //        tukeywin(N,1) is a Hann window.  Written against the SIGNED frequency
 //        index k, with DC at k = 0 where the shifted array puts it, the periodic

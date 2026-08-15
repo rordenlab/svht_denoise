@@ -1,6 +1,9 @@
-# Build products
+# Build products.  The mrdegibbs/ patterns are separate because a leading
+# `src/*.o` does not descend into a subdirectory.
 src/*.o
 src/*.d
+src/mrdegibbs/*.o
+src/mrdegibbs/*.d
 src/svht_denoise
 src/dn_testgen
 *.dSYM/
@@ -8,20 +11,24 @@ src/dn_testgen
 # Build flag stamp (see src/Makefile)
 src/.build_flags
 
-# Benchmark output
-/vida/
-/iso15/
+# Benchmark data and output.  benchmark-large/ holds a 1.9 GB download and
+# several GB of derived series; benchmark_large repopulates it on demand.
 benchmark/dwidenoise/
 benchmark/svht_denoise/
 benchmark/dipy/
-/edden/mrtrix/
-/edden/svht_denoise/
+benchmark-large/dwi/
+benchmark-large/mrtrix/
+benchmark-large/svht_denoise/
+benchmark-large/timings.tsv
+# Animation the benchmark writes; the tracked README copy in images/ is a
+# hand-compressed version of it.
+benchmark-large/*.gif
 
 # Audit scratch
 audit_*.md
 plan_*.md
 
-# Python bytecode (edden/mrtrix.py)
+# Python bytecode
 __pycache__/
 *.pyc
 

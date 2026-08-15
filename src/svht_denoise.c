@@ -20,8 +20,14 @@
 #include "dn_patch.h"
 #include "dn_phase.h"
 #include "dn_run.h"
+#ifdef DN_DEGIBBS
+#include "mrdegibbs/dg.h"
+#endif
 
-#define DN_VERSION "0.1.20260808"
+#define DN_VERSION "0.1.20260813"
+
+// -degibbs: no, yes (after denoising), or only (instead of denoising).
+enum { DN_DG_NO = 0, DN_DG_YES, DN_DG_ONLY };
 
 static void usage(void) {
 	printf("svht_denoise %s -- DWI denoising by optimal singular value hard thresholding\n", DN_VERSION);
@@ -69,6 +75,15 @@ static void usage(void) {
 	printf("  -rank <image>     write the number of retained components (uint16)\n");
 	printf("  -extent <k>       patch side length, odd, k^3 > number of volumes.\n");
 	printf("                    Default: the smallest odd k that satisfies this.\n");
+#ifdef DN_DEGIBBS
+	printf("  -degibbs <y/n/o>  remove Gibbs ringing by local subvoxel shifts: yes, no\n");
+	printf("                    (default) or only.  \"yes\" denoises first and degibbses\n");
+	printf("                    the result, which is the order these belong in; \"only\"\n");
+	printf("                    skips the denoising entirely and accepts a 3D image.\n");
+	printf("                    Do NOT use on partial Fourier acquisitions.\n");
+	printf("                    Within-slice axes are x and y.  Adapted from MRtrix3\n");
+	printf("                    mrdegibbs (MPL-2.0); method of Kellner et al. 2016.\n");
+#endif
 	printf("  -nthreads <n>     worker threads (default: all cores). -p is an alias.\n");
 	printf("  -quiet            suppress the run summary on stderr\n");
 	printf("  -version, --version   print the version and exit\n");
@@ -310,6 +325,7 @@ int main(int argc, char *argv[]) {
 	// silently selected the automatic size and reported it as "(auto)", while
 	// every other value the help text calls invalid -- 2, -1 -- was rejected.
 	int extent = 0, extent_given = 0, nthreads = 0, quiet = 0;
+	int degibbs = DN_DG_NO;
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
@@ -345,6 +361,22 @@ int main(int argc, char *argv[]) {
 					dn_err("-phaseunits must be radians, degrees, turns/cycles or auto (got '%s')\n", v);
 					return EXIT_FAILURE;
 				}
+			}
+			else if (!strcmp(a, "-degibbs")) {
+#ifdef DN_DEGIBBS
+				if (!strcmp(v, "y")) degibbs = DN_DG_YES;
+				else if (!strcmp(v, "n")) degibbs = DN_DG_NO;
+				else if (!strcmp(v, "o")) degibbs = DN_DG_ONLY;
+				else {
+					dn_err("-degibbs must be y, n or o (got '%s')\n", v);
+					return EXIT_FAILURE;
+				}
+#else
+				(void)v;
+				dn_err("-degibbs is not compiled into this build.\n");
+				dn_err("  Rebuild with 'make DEGIBBS=1'.\n");
+				return EXIT_FAILURE;
+#endif
 			}
 			else if (!strcmp(a, "-extent")) {
 				if (parse_int(v, &extent)) { dn_err("-extent needs an integer (got '%s')\n", v); return EXIT_FAILURE; }
@@ -395,6 +427,31 @@ int main(int argc, char *argv[]) {
 			return EXIT_FAILURE;
 		}
 	}
+	// -degibbs o does no denoising, so everything describing the denoiser -- its
+	// mask, its by-products, its patch size, and the phase rotation that exists
+	// only to change the noise the denoiser sees -- has nothing to act on.
+	// Ignoring them silently would give a run that looked fine and wrote fewer
+	// files than were asked for.
+	if (degibbs == DN_DG_ONLY && (fmask || fnoise || frank || fphase || freal || extent_given)) {
+		dn_err("-degibbs o does no denoising, so -mask, -noise, -rank, -phase, -real\n");
+		dn_err("  and -extent have nothing to act on.\n");
+		return EXIT_FAILURE;
+	}
+	// A masked run leaves hard zeros outside the mask, and a hard zero edge is
+	// precisely the discontinuity the Kellner method rings on.  Degibbsing that
+	// both breaks the "outside the mask reads as zero" promise -- measured, 647
+	// of 648 outside voxels came back non-zero, peaking at a quarter of the data
+	// range -- and rings the mask boundary INWARDS, corrupting voxels that are
+	// inside it.  Neither is recoverable by re-zeroing afterwards, so refuse the
+	// combination rather than quietly returning something worse than either
+	// stage alone.  `-degibbs o` already refuses -mask, for its own reason.
+	if (degibbs == DN_DG_YES && fmask) {
+		dn_err("-mask cannot be combined with -degibbs y.\n");
+		dn_err("  Masking leaves hard zeros outside the mask, and ringing removal would\n");
+		dn_err("  treat that edge as signal -- corrupting voxels inside the mask too.\n");
+		dn_err("  Denoise with -mask, then run -degibbs o on the result if you need both.\n");
+		return EXIT_FAILURE;
+	}
 	if (punits_given && !fphase) {
 		dn_err("-phaseunits describes the -phase image, which was not given.\n");
 		return EXIT_FAILURE;
@@ -405,7 +462,9 @@ int main(int argc, char *argv[]) {
 	float *out = NULL, *noise = NULL;
 	uint16_t *rank = NULL;
 
-	if (dn_image_read(fin, "input", 1, &img)) return EXIT_FAILURE;
+	// Not require4d in "only" mode: mrdegibbs accepts a 3D image, and the
+	// >= 2 volume rule belongs to the denoiser, which is not running.
+	if (dn_image_read(fin, "input", degibbs != DN_DG_ONLY, &img)) return EXIT_FAILURE;
 
 	// After the read, not before: resolving an output prefix needs the input's
 	// nifti_type.  Still ahead of every write, and ahead of the denoising itself.
@@ -420,6 +479,35 @@ int main(int argc, char *argv[]) {
 	};
 	if (check_path_collisions(paths, (int)(sizeof paths / sizeof paths[0]),
 	                          img.nifti_type)) goto done;
+
+#ifdef DN_DEGIBBS
+	// Before any work, not after: this needs only the header, and reaching it
+	// from the -degibbs y call site meant a full denoise ran and was then thrown
+	// away when the geometry turned out to be unusable.
+	if (degibbs != DN_DG_NO && dn_degibbs_check(img.nx, img.ny)) goto done;
+#endif
+
+#ifdef DN_DEGIBBS
+	// "Only" short-circuits everything the denoiser needs -- geometry, mask,
+	// scratch budget -- and rewrites the input buffer in place, so there is no
+	// second copy of the series.
+	if (degibbs == DN_DG_ONLY) {
+		if (nthreads < 1) nthreads = dn_default_threads();
+		// Report what will really run, not what was asked for -- same contract the
+		// denoising path has, and it was missing here.
+		nthreads = dn_degibbs_threads(img.nx, img.ny, img.nz, img.nvol, nthreads);
+		if (!quiet) {
+			dn_err("input        : %s (%dx%dx%d, %d volume%s)\n", fin,
+			        img.nx, img.ny, img.nz, img.nvol, img.nvol == 1 ? "" : "s");
+			dn_err("degibbs      : only, x-y planes (no denoising)\n");
+			dn_err("threads      : %d\n", nthreads);
+		}
+		if (dn_degibbs(img.data, img.nx, img.ny, img.nz, img.nvol, nthreads)) goto done;
+		if (dn_write_f32(&img, fout, img.data, img.nvol)) goto done;
+		status = EXIT_SUCCESS;
+		goto done;
+	}
+#endif
 
 	const int auto_extent = dn_auto_extent(img.nvol);
 	const int extent_was_auto = !extent_given;
@@ -456,6 +544,14 @@ int main(int argc, char *argv[]) {
 		dn_err("threads      : %d\n", nthreads);
 		if (mask)
 			dn_err("mask         : %s (%zu of %zu voxels)\n", fmask, n_in_mask, img.nvox3d);
+#ifdef DN_DEGIBBS
+		// Its OWN effective count, not the denoiser's: degibbs caps by planes and
+		// by its own scratch budget, so the two stages can legitimately run
+		// different team sizes and one number would be wrong for one of them.
+		if (degibbs == DN_DG_YES)
+			dn_err("degibbs      : yes, x-y planes (%d threads)\n",
+			        dn_degibbs_threads(img.nx, img.ny, img.nz, img.nvol, nthreads));
+#endif
 	}
 
 	// Before anything is allocated for the denoising, and before the first write:
@@ -490,6 +586,14 @@ int main(int argc, char *argv[]) {
 	r.nthreads = nthreads;
 
 	if (dn_run_execute(&r)) goto done;
+
+#ifdef DN_DEGIBBS
+	// After the denoiser, never before: degibbsing first would alter the noise
+	// structure the denoiser models.  -noise and -rank describe the denoising and
+	// are untouched, as is -real, which is the input before either stage.
+	if (degibbs == DN_DG_YES &&
+	    dn_degibbs(out, img.nx, img.ny, img.nz, img.nvol, nthreads)) goto done;
+#endif
 
 	// Write the auxiliary maps first: if the disk fills, failing before the main
 	// output is written is less confusing than leaving a complete-looking result

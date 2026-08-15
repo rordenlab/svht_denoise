@@ -13,17 +13,33 @@ Volumes are chosen by DIFFUSION WEIGHTING, not by index: every volume whose
 b-value reaches --minb is shown.  The b-values come from a .bval beside the
 input, found automatically.  Without one, the --first/--last range is used as-is.
 
+Compressed inputs are inflated ONCE into a temporary directory and every frame
+is rendered from that. gzip is not seekable, so niimath must otherwise inflate a
+whole series to reach one volume, once per volume per row -- which is what left
+earlier runs on the 2 GB large series unfinished. Budget room for one
+uncompressed copy of each row (--tmpdir moves it).
+
 Example:
     python3 tools/make_anim.py                       # y 0.3, b >= 50
     python3 tools/make_anim.py --minb 1500           # the shells that matter
     python3 tools/make_anim.py -o z -s 0.5 -f 1 -l 30
+
+    # the large series, every b > 1500 volume, rows with different filenames:
+    python3 tools/make_anim.py -b benchmark-large --minb 1500 -s 0.45 -d 150 \\
+        --bval benchmark-large/dwi/sub-01_ses-1p5mm_dir-AP_dwi.bval \\
+        -R "svht_denoise/real.nii.gz=input (complex, rotated to real)" \\
+        -R "mrtrix/denoised.nii.gz=MRtrix3 MPPCA*" \\
+        -R "svht_denoise/denoised.nii.gz=svht_denoise" \\
+        images/anim_EDDEN1p5mm.gif
 """
 
 import argparse
+import gzip
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import nibabel as nib
@@ -69,15 +85,62 @@ def parse_args():
     p.add_argument("--labels", action=argparse.BooleanOptionalAction, default=True,
                    help="draw a row label on each panel (default: on)")
     p.add_argument("--niimath", default="niimath", help="path to the niimath binary")
+    p.add_argument("--tmpdir", type=Path, default=None,
+                   help="where to inflate .nii.gz inputs (default: the system temp dir). "
+                        "Needs room for one uncompressed copy of every row.")
     p.add_argument("out", nargs="?", type=Path, default=ROOT / "images" / "anim_compare.gif",
                    help="output GIF (default: <repo>/images/anim_compare.gif, the one README.md embeds)")
     return p.parse_args()
 
 
 def window(path, vols, pct):
-    """Robust intensity window taken from the displayed volumes of the input."""
-    data = np.asanyarray(nib.load(str(path)).dataobj)[..., vols]
+    """Robust intensity window taken from the displayed volumes of the input.
+
+    Indexes the proxy per volume rather than materialising the series: on a
+    decompressed cache that reads only the volumes shown, where
+    asanyarray(dataobj) pulled all 297 of them (2.1 GB) to look at 180.
+    """
+    proxy = nib.load(str(path)).dataobj
+    data = np.stack([np.asanyarray(proxy[..., v]) for v in vols])
     return 0.0, float(np.percentile(data, pct))
+
+
+def uncompressed_bytes(path):
+    """What `path` will occupy once inflated, from its header alone."""
+    img = nib.load(str(path))
+    n = int(np.prod(img.shape)) * int(img.get_data_dtype().itemsize)
+    return n + 352
+
+
+# THE REASON THIS SCRIPT IS USABLE ON A LARGE SERIES.  gzip is not seekable, so
+# niimath must inflate the WHOLE file to reach one volume, and the frame loop
+# calls it once per volume per row: 540 full inflations of a 2 GB series for a
+# 180-frame three-row animation, which is where earlier runs on the
+# large series were left to die.  Inflating ONCE up front turns that into three.
+#
+# It is worth this much and no more.  Measured, niimath does NOT read an
+# uncompressed file whole -- it seeks to the volume it was asked for, so three
+# renders off a 173 MB .nii took 0.119 s TOTAL.  So there is nothing left for the
+# concurrency an older comment here proposed; the remaining cost is the inflation
+# itself, which is serial in gzip and already down to once per row.
+def uncompress(path, tmpdir, tag, quiet=False):
+    """Inflate `path` into `tmpdir` once; return the path to render from.
+
+    `tag` makes the temporary name unique per ROW, which is not decoration: the
+    default rows are input/dwi.nii.gz, dwidenoise/dwi.nii.gz and
+    svht_denoise/dwi.nii.gz, so keying the cache on the basename alone had all
+    three overwrite one file and every row render from whichever landed last.
+    """
+    if path.suffix != ".gz":
+        return path
+    out = Path(tmpdir) / f"row{tag}.nii"
+    t0 = time.monotonic()
+    with gzip.open(path, "rb") as src, open(out, "wb") as dst:
+        shutil.copyfileobj(src, dst, length=8 << 20)
+    if not quiet:
+        mb = out.stat().st_size / (1 << 20)
+        print(f"  inflated {path.name} -> {mb:.0f} MiB in {time.monotonic() - t0:.1f} s")
+    return out
 
 
 def find_bval(folder, given):
@@ -120,15 +183,6 @@ def select(volumes_path, folder, args):
     return keep
 
 
-# SLOW ON A .nii.gz, AND BADLY: gzip is not seekable, so niimath inflates the
-# WHOLE series to reach one volume, and this calls it once per volume per row --
-# 540 full decompressions of a 2 GB series for a 180-frame three-row animation.
-#
-# Two fixes, in order of what they are worth. Decompressing ONCE to a temporary
-# .nii and rendering every frame from that turns O(frames) inflations into one,
-# which is the ~500x. Running the niimath calls concurrently is the easy ~14x on
-# top. Neither is done here because the script has only ever been used on the
-# small bundled series, where the whole thing takes seconds.
 def render(niimath, nii, vol, args, lo, hi, png):
     cmd = [niimath, str(nii), "-crop", str(vol), "1", "-bitmap", "-u", "0"]
     if args.zoom != 1.0:
@@ -176,11 +230,24 @@ def main():
 
     vols = select(volumes[0], volumes[0].parent, args)
 
-    lo, hi = args.range if args.range else window(volumes[0], vols, args.pct)
-    print(f"intensity window {lo:g}..{hi:g}")
-
     frames = []
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(dir=args.tmpdir) as tmp:
+        # Refuse up front rather than 90% through a long run: three inflated
+        # copies of the large series are 6.4 GB, and the failure when they do not
+        # fit lands after the slowest step.
+        need = sum(uncompressed_bytes(n) for n in volumes if n.suffix == ".gz")
+        if need:
+            free = shutil.disk_usage(tmp).free
+            print(f"inflating {sum(1 for n in volumes if n.suffix == '.gz')} series "
+                  f"({need / (1 << 30):.1f} GiB) into {tmp}")
+            if need > free * 0.95:
+                sys.exit(f"not enough room in {tmp}: need {need / (1 << 30):.1f} GiB, "
+                         f"{free / (1 << 30):.1f} GiB free. Point --tmpdir somewhere roomier.")
+            volumes = [uncompress(n, tmp, i) for i, n in enumerate(volumes)]
+
+        lo, hi = args.range if args.range else window(volumes[0], vols, args.pct)
+        print(f"intensity window {lo:g}..{hi:g}")
+
         png = Path(tmp) / "frame.png"
         for n, vol in enumerate(vols, 1):
             panels = [render(niimath, nii, vol, args, lo, hi, png) for nii in volumes]

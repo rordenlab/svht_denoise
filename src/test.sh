@@ -402,6 +402,51 @@ else bad "the multi-thread run used ${sv_n:-?} worker; the comparison below prov
 if cmp -s "$WORK/t1.nii" "$WORK/t8.nii"
 then ok "1 thread == $sv_n threads, byte for byte"; else bad "thread count changed the output"; fi
 
+# -degibbs is a build option, so ask the binary rather than assuming.  A
+# DEGIBBS=0 build must run the rest of this suite green and skip only this.
+if "$BIN" -help 2>&1 | grep -q -- '-degibbs'; then
+echo "degibbs"
+# "only" does no denoising, so the denoiser's own options have nothing to act on.
+# Ignoring them silently would write fewer files than were asked for, at exit 0.
+check "-degibbs o rejects -noise" 1 "$BIN" "$M" "$WORK/o.nii" -quiet -degibbs o -noise "$WORK/n.nii"
+check "-degibbs o rejects -mask"  1 "$BIN" "$M" "$WORK/o.nii" -quiet -degibbs o -mask "$WORK/mask.nii"
+check "bad -degibbs value"        1 "$BIN" "$M" "$WORK/o.nii" -quiet -degibbs z
+# -mask with -degibbs y once wrote NON-ZERO data outside the mask -- 647 of 648
+# voxels, peaking at a quarter of the data range -- because ringing removal ran
+# over the hard zero edge the mask leaves, which also rings INWARDS into voxels
+# that are inside it.  Refused rather than re-zeroed: re-zeroing would restore
+# the invariant this suite checks while leaving the in-mask corruption.
+check "-mask refused with -degibbs y" 1 "$BIN" "$M" "$WORK/o.nii" -quiet -mask "$WORK/mask.nii" -degibbs y
+check "-degibbs y runs"           0 "$BIN" "$M" "$WORK/dgy.nii" -quiet -degibbs y
+# "only" is the one mode that takes a 3D image: the >= 2 volume rule belongs to
+# the denoiser, which is not running.  The mask fixture is the single-volume one.
+check "-degibbs o accepts 3D"     0 "$BIN" "$WORK/mask.nii" "$WORK/dg3d.nii" -quiet -degibbs o
+# "no" must be EXACTLY the build without the option; anything else means adding a
+# second algorithm has disturbed the default path.
+check "-degibbs n runs"           0 "$BIN" "$M" "$WORK/dgn.nii" -quiet -degibbs n
+check "no -degibbs runs"          0 "$BIN" "$M" "$WORK/dgoff.nii" -quiet
+if cmp -s "$WORK/dgn.nii" "$WORK/dgoff.nii"
+then ok "-degibbs n == no -degibbs, byte for byte"; else bad "-degibbs n disturbed the default path"; fi
+# Its own pool, so its own byte-identity check: the denoiser's above proves
+# nothing about this one.
+check "-degibbs o, 1 thread"      0 "$BIN" "$M" "$WORK/dg_t1.nii" -quiet -degibbs o -nthreads 1
+check "-degibbs o, many threads"  0 "$BIN" "$M" "$WORK/dg_t8.nii" -quiet -degibbs o -nthreads 8
+if cmp -s "$WORK/dg_t1.nii" "$WORK/dg_t8.nii"
+then ok "degibbs: 1 thread == 8 threads, byte for byte"; else bad "degibbs thread count changed the output"; fi
+# A PINNED number, because nothing else here would notice a changed twiddle: the
+# kernel stays self-consistent under any coefficient, so only a recorded value
+# fails when the arithmetic moves.  This one is not merely recorded from our own
+# output -- mrdegibbs produces the same image BIT FOR BIT on this fixture, and
+# the same RMS to the tolerance below.  The fixture is 9x9, deliberately ODD,
+# which is the branch that skips the Nyquist zeroing.
+check "degibbs RMS is unchanged"  0 "$GEN" rms "$WORK/dg_t1.nii" 614.68488 1e-6
+# ...and it has to actually do something; an identity transform would pin fine.
+"$GEN" cmp "$WORK/dg_t1.nii" "$M" 0 >/dev/null 2>&1; sv_rc=$?
+if [ "$sv_rc" -eq 1 ]; then ok "-degibbs o changed the image"
+elif [ "$sv_rc" -eq 0 ]; then bad "-degibbs o returned its input unchanged"
+else bad "degibbs comparison failed to run (cmp exit $sv_rc)"; fi
+fi
+
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

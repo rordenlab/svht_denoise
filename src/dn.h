@@ -43,6 +43,16 @@ static inline int dn_mul_size(size_t a, size_t b, size_t *out) {
 void *dn_calloc(size_t count, size_t size);
 void *dn_malloc(size_t count, size_t size);
 
+// Run `fn(arg)` on `nthreads` workers and join them.  Returns the number that
+// actually started; 0 means it ran inline on this thread, which is what
+// nthreads == 1 asks for and also what happens if no thread could be created.
+//
+// Shared by dn_run.c and mrdegibbs/dg.c because a PARTIAL failure has to be
+// reported: both print a thread count before starting, and continuing quietly
+// with fewer workers than announced makes that number a fiction.  Having one
+// copy is why degibbs cannot drift back into not saying so.
+int dn_thread_run(void *(*fn)(void *), void *arg, int nthreads);
+
 #ifdef __cplusplus
 }
 #endif
