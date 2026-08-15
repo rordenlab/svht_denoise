@@ -134,23 +134,25 @@ And, from the repository root, with a Python environment that has DIPY (`mkdir -
 
 Here are findings for an Apple MacBook with M4 Pro CPU (14 core, 10 performance). Time is elapsed wall clock, and peak RAM is the maximum resident set size, both as reported by `/usr/bin/time -l`.
 
-The `svht_denoise` rows are the default macOS build, with the bundled static zlib-ng, and are the median of five runs (spread 1650-1680 ms and 14070-14260 ms respectively). Since which zlib went in changes the wall clock and nothing else, a timing is only comparable to another taken with the same one — `make` prints which it used. The `dwidenoise` rows are unchanged and were measured in an earlier session.
+All five rows were measured in ONE sitting, round-robin across the configurations so thermal drift could not favour whichever tool ran last: median of five runs each, three for DIPY. The `svht_denoise` rows are the default macOS build with the bundled static zlib-ng — since which zlib went in changes the wall clock and nothing else, a timing is only comparable to another taken with the same one, and `make` prints which it used.
 
-Note how differently the two rows moved: zlib-ng took 430 ms off the 14-thread run (2080 → 1650, a 21% saving) but only ~650 ms off the single-threaded one (14750 → 14100, about 4%). Compression is serial either way, so it is a large share of the wall clock only once the denoise itself is spread across cores — which is also why it was worth fixing.
+The `dwidenoise` and `dipy` rows are the control. They are unchanged code, and re-measuring them reproduced their previous figures to within 0.5-2.2% (1950 → 1960, 11620 → 11880, 59590 → 60760), which is what says the sitting is trustworthy rather than merely self-consistent.
+
+zlib-ng is worth more once the denoise is spread across cores, because compression is serial either way: it took ~430 ms off the 14-thread run and only ~650 ms off the single-threaded one, which is a 21% saving against 4%.
 
 The `dipy mppca` row is DIPY 1.11.0 on Python 3.12 (NumPy 2.1.3), median of three runs, at `patch_radius=2` — a 5x5x5 window, the same patch the other two use here. It has no thread option and uses one core (user time equals wall clock), so there is no 14-thread row for it; the figure is whole-process, of which interpreter startup and imports are 0.3 s. It is the closest algorithmic comparison to `dwidenoise` rather than to this tool: both are Marchenko-Pastur PCA, and svht_denoise is a different estimator. The memory is the more interesting column — DIPY works in float64 on the whole series, where the two C tools stream float32.
 
 | Method       | Threads | Time (ms) | Peak RAM (MiB) |
 | ------------ | ------- | --------- | ------------- |
-| svht_denoise |      14 |      1650 |           152 |
-| svht_denoise |       1 |     14100 |           151 |
-| dwidenoise   |      14 |      1950 |           228 |
-| dwidenoise   |       1 |     11620 |           226 |
-| dipy mppca   |       1 |     59590 |           849 |
+| svht_denoise |      14 |      1270 |           152 |
+| svht_denoise |       1 |     10970 |           151 |
+| dwidenoise   |      14 |      1960 |           227 |
+| dwidenoise   |       1 |     11880 |           226 |
+| dipy mppca   |       1 |     60760 |           844 |
 
-**That table predates a round of internal optimisation and has not been re-measured.** Measured before-and-after in one sitting on this same bundled series, at 14 threads and median of five alternating rounds, that work went from 1.79 s to 1.50 s of wall clock (-16%) and from 19.69 s to 16.01 s of CPU time (-19%), with peak RSS unchanged at 152 MiB. Those absolute times are not comparable with the table's 1650 ms — different sitting, different conditions — which is why the rows are left as they were measured rather than partially updated. Re-measuring all three tools in one sitting is still outstanding.
+A round of internal optimisation moved the `svht_denoise` rows and nothing else: 1650 → 1270 ms at 14 threads and 14100 → 10970 ms single-threaded, both about -23%, at unchanged memory. The single-threaded row is the one that changed character — it was slower than `dwidenoise` and is now faster.
 
-The saving grows with the series. On a 100x100x58 series of 138 volumes at 7x7x7 (not in this repository, same 14 threads, mains power, quiet machine, median of five alternating rounds) the same change reads 94.66 s to 58.67 s of wall clock (-38%) and 1220.96 s to 726.46 s of CPU (-40%), peak RSS 778.1 to 775.5 MiB. Nothing about the interface or the output format changed. One of those changes does move values — a local `hypot` in the eigensolver's QL inner loop — at 2.24e-10 relative L2 error on that series, with the rank map byte-identical.
+The saving grows with the series. On a 100x100x58 series of 138 volumes at 7x7x7 (not in this repository, same 14 threads, mains power, median of five alternating rounds) the same change reads 94.66 s to 58.67 s of wall clock (-38%) and 1220.96 s to 726.46 s of CPU (-40%), peak RSS 778.1 to 775.5 MiB. Nothing about the interface or the output format changed. One of those changes does move values — a local `hypot` in the eigensolver's QL inner loop — at 2.24e-10 relative L2 error on that series, with the rank map byte-identical.
 
 `scripts/bench.sh <input> <output> <binary>...` produced those figures. It alternates candidates and reverses their order every other round so neither sits in the same thermal position twice, reports the median of the rounds, and refuses to time at all on a loaded machine, on battery, or in Low Power Mode — battery alone was measured at 2x, and nothing in the numbers afterwards says which state a timing was taken in.
 
