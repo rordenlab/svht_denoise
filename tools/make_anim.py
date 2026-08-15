@@ -120,6 +120,15 @@ def select(volumes_path, folder, args):
     return keep
 
 
+# SLOW ON A .nii.gz, AND BADLY: gzip is not seekable, so niimath inflates the
+# WHOLE series to reach one volume, and this calls it once per volume per row --
+# 540 full decompressions of a 2 GB series for a 180-frame three-row animation.
+#
+# Two fixes, in order of what they are worth. Decompressing ONCE to a temporary
+# .nii and rendering every frame from that turns O(frames) inflations into one,
+# which is the ~500x. Running the niimath calls concurrently is the easy ~14x on
+# top. Neither is done here because the script has only ever been used on the
+# small bundled series, where the whole thing takes seconds.
 def render(niimath, nii, vol, args, lo, hi, png):
     cmd = [niimath, str(nii), "-crop", str(vol), "1", "-bitmap", "-u", "0"]
     if args.zoom != 1.0:
