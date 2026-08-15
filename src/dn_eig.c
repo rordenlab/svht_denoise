@@ -539,7 +539,6 @@ int dn_eig_values(dn_eig *e, const double *a, double *evals) {
 	if (n == 1) {
 		if (!spectrum_finite(a, 1)) return -2;
 		evals[0] = a[0];
-		e->ev[0] = a[0];
 		e->staged = 1;
 		return 0;
 	}
@@ -564,7 +563,6 @@ int dn_eig_values(dn_eig *e, const double *a, double *evals) {
 		if (rc) return rc;   // dn_eig_solve already checked finiteness
 		e->full_valid = 1;
 		e->staged = 1;
-		memcpy(e->ev, evals, (size_t)n * sizeof(double));
 		return 0;
 	}
 

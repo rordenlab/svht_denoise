@@ -316,6 +316,13 @@ verbose:
 # The profile is stored once per machine; the release step builds, tests, signs,
 # packages, notarises, staples and verifies. `make macos-pkg-adhoc` is the
 # unsigned local-testing path.
+# Written out in full, and DELIBERATELY not derived from svht_denoise.c's
+# DN_VERSION even though the two must agree.  Deriving it was tried: the
+# `override ... := $(value ...)` freeze below exists to guarantee this variable
+# holds literal characters and never make syntax, so a default of
+# `$(DN_VERSION_H)` is frozen as those nine literal characters and the release
+# ships an empty version.  Keeping the number here is the safe half of that
+# trade; bump both when it changes.
 VERSION ?= 0.1.20260808
 MACOS_SIGN_IDENTITY ?=
 MACOS_INSTALLER_IDENTITY ?=
