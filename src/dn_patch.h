@@ -35,8 +35,12 @@ int dn_auto_extent(int nvol);
 
 // Per-worker scratch.  One arena per thread; nothing here is shared.
 typedef struct {
-	int m, n;
-	double *pt;      // n*m, patch transposed: pt[j*m + i] = voxel i, volume j
+	// float, NOT double, and that is exact rather than a compromise: every value
+	// in here is copied straight out of a float32 image, so widening it at the
+	// point of use gives bit-for-bit the same operands the double array held.  It
+	// halves the largest per-worker array -- 370 kB to 185 kB at 138x343 -- which
+	// is what the Gram loop's inner passes actually stream.
+	float *pt;       // n*m, patch transposed: pt[j*m + i] = voxel i, volume j
 	double *gram;    // n*n
 	double *evecs;   // n*n
 	double *evals;   // n

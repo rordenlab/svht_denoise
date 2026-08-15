@@ -7,8 +7,10 @@
 #
 # Expands the package into a scratch directory and checks the executable it
 # would install: that it is correctly signed, carries no dependency outside
-# macOS itself, has no build-machine path baked in, contains the slices it
-# claims, and actually runs. The last point matters most -- a package can be
+# macOS itself, has no build-machine path baked in, and actually runs.  It
+# REPORTS the architectures rather than asserting them; the arm64-only gate is
+# in package_macos.sh, before signing, so that this stays usable on any package
+# including an older universal one. The last point matters most -- a package can be
 # perfectly signed and still install a binary that dies looking for a library
 # that is not there.
 set -eu

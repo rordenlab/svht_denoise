@@ -62,7 +62,6 @@
 
 #include <math.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "dn.h"
 #include "dn_nii.h"

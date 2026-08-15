@@ -47,11 +47,13 @@ struct dn_eig {
 // tred2 + tql2
 // ---------------------------------------------------------------------------
 
-// Householder reduction of the symmetric matrix V (n*n row-major, destroyed) to
-// tridiagonal form.  On exit V holds the accumulated orthogonal transform, d the
-// diagonal and e the sub-diagonal.
-static void tred2(double *V, double *d, double *e, int n) {
+// The Householder reduction, shared by both callers below.  They differ only in
+// the TAIL, and only because d is left holding the per-step h values here:
+// tred_reduce puts the diagonal back and keeps the reflectors, while tred2
+// consumes those same h values to expand the transform.
+static void tred_reduce_raw(double *V, double *d, double *e, double *hh, int n) {
 	for (int j = 0; j < n; j++) d[j] = V[(size_t)(n - 1) * n + j];
+	for (int i = 0; i < n; i++) hh[i] = 0.0;
 
 	for (int i = n - 1; i > 0; i--) {
 		double scale = 0.0, h = 0.0;
@@ -75,7 +77,7 @@ static void tred2(double *V, double *d, double *e, int n) {
 
 			for (int j = 0; j < i; j++) {
 				f = d[j];
-				V[(size_t)j * n + i] = f;
+				V[(size_t)j * n + i] = f;          // the reflector, kept
 				g = e[j] + V[(size_t)j * n + j] * f;
 				for (int k = j + 1; k <= i - 1; k++) {
 					g += V[(size_t)k * n + j] * d[k];
@@ -85,8 +87,8 @@ static void tred2(double *V, double *d, double *e, int n) {
 			}
 			f = 0.0;
 			for (int j = 0; j < i; j++) { e[j] /= h; f += e[j] * d[j]; }
-			double hh = f / (h + h);
-			for (int j = 0; j < i; j++) e[j] -= hh * d[j];
+			double hhh = f / (h + h);
+			for (int j = 0; j < i; j++) e[j] -= hhh * d[j];
 			for (int j = 0; j < i; j++) {
 				f = d[j];
 				g = e[j];
@@ -96,8 +98,17 @@ static void tred2(double *V, double *d, double *e, int n) {
 				V[(size_t)i * n + j] = 0.0;
 			}
 		}
+		hh[i] = h;
 		d[i] = h;
 	}
+}
+
+// Householder reduction of the symmetric matrix V (n*n row-major, destroyed) to
+// tridiagonal form.  On exit V holds the accumulated orthogonal transform, d the
+// diagonal and e the sub-diagonal.  hh is scratch: this caller wants the
+// transform expanded rather than the reflectors kept, so it never reads it back.
+static void tred2(double *V, double *d, double *e, double *hh, int n) {
+	tred_reduce_raw(V, d, e, hh, n);   // leaves d holding the per-step h values
 
 	for (int i = 0; i < n - 1; i++) {
 		V[(size_t)(n - 1) * n + i] = V[(size_t)i * n + i];
@@ -121,6 +132,60 @@ static void tred2(double *V, double *d, double *e, int n) {
 	e[0] = 0.0;
 }
 
+
+// sqrt(a*a + b*b), replacing libm's hypot in tql2's rotation loop -- the two
+// call sites there are 7% of the whole run, and appeared in the profile as
+// DYLD-STUB$$hypot, so libm's was not even being inlined.  Worth 8.7% of CPU
+// time on 100x100x58x138.
+//
+// THE FAST PATH MUST NOT DIVIDE, and that is the whole point rather than a
+// micro-optimisation.  The obvious scaling form -- hi * sqrt(1 + (lo/hi)^2) for
+// every input -- was written first and measured: it is worth 1.3%, because the
+// division costs about what the call it replaced did.  Only the version below,
+// which reaches sqrt() with no division at all in the ordinary case, converts
+// the 7% the profile promised.
+//
+// The guarded range is nowhere near the exponent limits (a double reaches
+// ~1.8e308), so squaring inside it cannot overflow or flush to zero, and the
+// scaled form still catches anything outside.
+//
+// THIS IS NOT A DROP-IN FOR libm's hypot.  `a*a + b*b` rounds before the sqrt
+// does, where hypot is correctly rounded once; over 4 million pairs spanning
+// 2^[-300, 300], 0.56% disagree, always by exactly 1 ulp.  Swapping back to
+// hypot therefore does NOT reproduce a previous output bit for bit -- end to end
+// it moves the denoised series by ~2e-10 relative L2, well inside float32, with
+// the rank map unchanged.  What the tool promises is determinism, which holds
+// because dn_hypot is used consistently, not because it matches libm.
+//
+// Measure that with FULL-ENTROPY inputs: 24-bit mantissas make a*a and b*b
+// exactly representable, and duly report agreement on every one of 4 M pairs.
+//
+// Non-finite behaviour is NOT simply "NaN in, NaN out".  (+-Inf, finite) gives
+// Inf, as hypot does.  Two cases deviate, both because a comparison against a
+// NaN is false and so `hi` takes the other operand:
+//
+//   (Inf, NaN) and (NaN, Inf) give NaN where hypot must give Inf.
+//   (NaN, +-0.0) gives 0.0 -- it SWALLOWS the NaN.  (0.0, NaN) gives NaN, so
+//   the asymmetry is real rather than a typo.
+//
+// Only the second could hide anything, and only from `dn_hypot(p, e[i])` with a
+// NaN p and an exactly-zero e[i]; the other call site passes a literal 1.0.
+// Reaching it needs a non-finite Gram, and every other rotation in the sweep
+// still carries the NaN into the spectrum that dn_eig_values checks.  Left
+// alone deliberately: guarding it means a NaN test on the fast path, which is
+// the one thing this function exists to keep clear.
+static inline double dn_hypot(double a, double b) {
+	const double s = a * a + b * b;
+	if (s > 1e-250 && s < 1e250) return sqrt(s);   // no division in the common case
+	a = fabs(a);
+	b = fabs(b);
+	const double hi = (a > b) ? a : b;
+	const double lo = (a > b) ? b : a;
+	if (hi == 0.0) return 0.0;   // the only case where lo/hi would be 0/0
+	const double r = lo / hi;
+	return hi * sqrt(1.0 + r * r);
+}
+
 #define DN_TQL2_MAXITER 50
 
 // Symmetric tridiagonal QL with implicit shifts.  Returns 0 on success, or the
@@ -128,9 +193,8 @@ static void tred2(double *V, double *d, double *e, int n) {
 //
 // V == NULL requests EIGENVALUES ONLY, which is what the split path needs: the
 // median wants the whole spectrum but the projection wants only a few vectors.
-// That was previously a second, near-identical copy of this function; the guard
-// is hoisted out of the length-n inner loop, so the values-only path costs one
-// predictable branch per rotation rather than a duplicated algorithm.
+// The guard is hoisted out of the length-n inner loop, so the values-only path
+// costs one predictable branch per rotation rather than a duplicated algorithm.
 static int tql2(double *V, double *d, double *e, int n) {
 	for (int i = 1; i < n; i++) e[i - 1] = e[i];
 	e[n - 1] = 0.0;
@@ -163,7 +227,7 @@ static int tql2(double *V, double *d, double *e, int n) {
 
 				double g = d[l];
 				double p = (d[l + 1] - g) / (2.0 * e[l]);
-				double r = hypot(p, 1.0);
+				double r = dn_hypot(p, 1.0);
 				if (p < 0) r = -r;
 				d[l] = e[l] / (p + r);
 				d[l + 1] = e[l] * (p + r);
@@ -182,7 +246,7 @@ static int tql2(double *V, double *d, double *e, int n) {
 					s2 = s;
 					g = c * e[i];
 					h = c * p;
-					r = hypot(p, e[i]);
+					r = dn_hypot(p, e[i]);
 					e[i + 1] = s * r;
 					s = e[i] / r;
 					c = p / r;
@@ -247,56 +311,8 @@ static int tql2(double *V, double *d, double *e, int n) {
 // Reduction half of tred2.  On exit V holds the Householder vector for step p in
 // V[0..p-1][p], hh[p] its h, d the diagonal and e the sub-diagonal.
 static void tred_reduce(double *V, double *d, double *e, double *hh, int n) {
-	for (int j = 0; j < n; j++) d[j] = V[(size_t)(n - 1) * n + j];
-	for (int i = 0; i < n; i++) hh[i] = 0.0;
-
-	for (int i = n - 1; i > 0; i--) {
-		double scale = 0.0, h = 0.0;
-		for (int k = 0; k < i; k++) scale += fabs(d[k]);
-		if (scale == 0.0) {
-			e[i] = d[i - 1];
-			for (int j = 0; j < i; j++) {
-				d[j] = V[(size_t)(i - 1) * n + j];
-				V[(size_t)i * n + j] = 0.0;
-				V[(size_t)j * n + i] = 0.0;
-			}
-		} else {
-			for (int k = 0; k < i; k++) { d[k] /= scale; h += d[k] * d[k]; }
-			double f = d[i - 1];
-			double g = sqrt(h);
-			if (f > 0) g = -g;
-			e[i] = scale * g;
-			h -= f * g;
-			d[i - 1] = f - g;
-			for (int j = 0; j < i; j++) e[j] = 0.0;
-
-			for (int j = 0; j < i; j++) {
-				f = d[j];
-				V[(size_t)j * n + i] = f;          // the reflector, kept
-				g = e[j] + V[(size_t)j * n + j] * f;
-				for (int k = j + 1; k <= i - 1; k++) {
-					g += V[(size_t)k * n + j] * d[k];
-					e[k] += V[(size_t)k * n + j] * f;
-				}
-				e[j] = g;
-			}
-			f = 0.0;
-			for (int j = 0; j < i; j++) { e[j] /= h; f += e[j] * d[j]; }
-			double hhh = f / (h + h);
-			for (int j = 0; j < i; j++) e[j] -= hhh * d[j];
-			for (int j = 0; j < i; j++) {
-				f = d[j];
-				g = e[j];
-				for (int k = j; k <= i - 1; k++)
-					V[(size_t)k * n + j] -= (f * e[k] + g * d[k]);
-				d[j] = V[(size_t)(i - 1) * n + j];
-				V[(size_t)i * n + j] = 0.0;
-			}
-		}
-		hh[i] = h;
-		d[i] = h;
-	}
-	// Recover the diagonal, which the loop above overwrote with the h values.
+	tred_reduce_raw(V, d, e, hh, n);
+	// Recover the diagonal, which the shared loop overwrote with the h values.
 	for (int j = 0; j < n; j++) d[j] = V[(size_t)j * n + j];
 	e[0] = 0.0;
 }
@@ -496,7 +512,7 @@ void dn_eig_free(dn_eig *e) {
 }
 
 // Full solve: tred2 to tridiagonal form, then tql2 with eigenvector accumulation.
-static int dn_eig_solve(dn_eig *e, double *a, double *evals, double *evecs) {
+static int dn_eig_solve(dn_eig *e, const double *a, double *evals, double *evecs) {
 	if (!e || !a || !evals || !evecs) return -1;
 	const int n = e->n;
 
@@ -507,14 +523,14 @@ static int dn_eig_solve(dn_eig *e, double *a, double *evals, double *evecs) {
 	}
 
 	memcpy(evecs, a, (size_t)n * n * sizeof(double));
-	tred2(evecs, e->d, e->e, n);
+	tred2(evecs, e->d, e->e, e->hh, n);
 	const int rc = tql2(evecs, e->d, e->e, n);
 	if (rc) return rc;
 	memcpy(evals, e->d, (size_t)n * sizeof(double));
 	return spectrum_finite(evals, n) ? 0 : -2;
 }
 
-int dn_eig_values(dn_eig *e, double *a, double *evals) {
+int dn_eig_values(dn_eig *e, const double *a, double *evals) {
 	if (!e || !a || !evals) return -1;
 	const int n = e->n;
 	e->staged = 0;
@@ -534,6 +550,12 @@ int dn_eig_values(dn_eig *e, double *a, double *evals) {
 	// for a full solve, while 125x102 patches take 357 us against 872 us.  Two
 	// data points, so the crossover is bracketed rather than pinpointed; 48 sits
 	// inside the bracket and the small-n case is not where any time is spent.
+	// dn_testgen's `big48` fixture is sized to exactly this number so that
+	// `make test` reaches the split path at all -- it is the ONLY fixture that
+	// does.  Raise this and resize the fixture in the same change: the two paths
+	// agree to ~1e-12 while the fixture's pinned RMS tolerance is 1e-5, so a
+	// fixture that quietly fell back to the full solver would keep passing while
+	// covering nothing.
 	#define DN_SPLIT_MIN 48
 
 	if (n < DN_SPLIT_MIN) {
@@ -574,7 +596,7 @@ int dn_eig_values(dn_eig *e, double *a, double *evals) {
 // trust: run the full tridiagonal QL from an identity basis to get every
 // eigenvector of T, then back-transform only the wanted columns.  This needs no
 // state beyond what dn_eig_values() already kept -- in particular it does NOT
-// need the Gram matrix, which has been destroyed by then.
+// need the Gram matrix back.
 static int eig_vectors_full_fallback(dn_eig *e, int first, int count, double *evecs) {
 	const int n = e->n;
 	double *Z = e->w;

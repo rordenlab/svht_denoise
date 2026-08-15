@@ -29,6 +29,14 @@
 #include "dn_coef.h"
 #include "dn_patch.h"
 
+// Gram columns computed per pass over a row.  Swept 2, 4 and 8 in the full
+// workload on 100x100x58x138 -- 1127, 795 and 821 seconds of CPU respectively,
+// against 1221 unblocked.  Do not infer this from clang's vectoriser: at 4 and 8
+// the cost model declines to vectorise the inner loop at all and only 2 keeps
+// the vectorised form, which would pick the width that recovers 8% over the one
+// that recovers 35%.
+#define DN_GRAM_BLOCK 4
+
 // Origin of the patch centred on `coord` along an axis of length `dim`, clamped
 // so the patch stays inside the image: near an edge the patch is SHIFTED INWARDS
 // rather than truncated or padded, so every voxel gets a full-size patch.
@@ -98,7 +106,6 @@ int dn_geom_init(dn_geom *g, int nx, int ny, int nz, int nvol, int extent) {
 		dn_err("internal: aspect ratio %g is out of range\n", g->beta);
 		return 1;
 	}
-	// dn_omega() would repeat this bisection internally; use the value in hand.
 	const double mu = dn_mp_median(g->beta);
 	g->omega = dn_lambda_star(g->beta) / sqrt(mu);
 	if (!(mu > 0.0) || !isfinite(mu) || !isfinite(g->omega) || g->omega <= 0.0) {
@@ -118,17 +125,16 @@ dn_work *dn_work_create(const dn_geom *g) {
 	if (!g) return NULL;
 	dn_work *w = (dn_work *)dn_calloc(1, sizeof(dn_work));
 	if (!w) return NULL;
-	w->m = g->m;
-	w->n = g->nvol;
-	w->pt = (double *)dn_malloc((size_t)w->n * w->m, sizeof(double));
-	w->gram = (double *)dn_malloc((size_t)w->n * w->n, sizeof(double));
-	w->evecs = (double *)dn_malloc((size_t)w->n * w->n, sizeof(double));
-	w->evals = (double *)dn_malloc((size_t)w->n, sizeof(double));
-	w->s = (double *)dn_malloc((size_t)w->n, sizeof(double));
-	w->yc = (double *)dn_malloc((size_t)w->n, sizeof(double));
-	w->acc = (double *)dn_malloc((size_t)w->n, sizeof(double));
-	w->offset = (int32_t *)dn_malloc((size_t)w->m, sizeof(int32_t));
-	w->eig = dn_eig_create(w->n);
+	const int m = g->m, n = g->nvol;
+	w->pt = (float *)dn_malloc((size_t)n * m, sizeof(float));
+	w->gram = (double *)dn_malloc((size_t)n * n, sizeof(double));
+	w->evecs = (double *)dn_malloc((size_t)n * n, sizeof(double));
+	w->evals = (double *)dn_malloc((size_t)n, sizeof(double));
+	w->s = (double *)dn_malloc((size_t)n, sizeof(double));
+	w->yc = (double *)dn_malloc((size_t)n, sizeof(double));
+	w->acc = (double *)dn_malloc((size_t)n, sizeof(double));
+	w->offset = (int32_t *)dn_malloc((size_t)m, sizeof(int32_t));
+	w->eig = dn_eig_create(n);
 	if (!w->pt || !w->gram || !w->evecs || !w->evals || !w->s || !w->yc || !w->acc ||
 	    !w->offset || !w->eig) {
 		dn_work_free(w);
@@ -230,11 +236,11 @@ static int patch_gather_nonzero(const dn_geom *g, dn_work *w, const float *img,
 	int nonzero = 0;
 	for (int j = 0; j < n; j++) {
 		const float *vol = img + (size_t)j * nvox3d + base;
-		double *dst = w->pt + (size_t)j * m;
+		float *dst = w->pt + (size_t)j * m;
 		for (int i = 0; i < m; i++) {
-			const double v = (double)vol[w->offset[i]];
+			const float v = vol[w->offset[i]];
 			dst[i] = v;
-			nonzero |= (v != 0.0);
+			nonzero |= (v != 0.0f);
 		}
 	}
 	return nonzero;
@@ -264,19 +270,56 @@ int dn_denoise_voxel(const dn_geom *g, dn_work *w, const float *img,
 	// chain through the FMA latency, which stops the compiler vectorising and
 	// leaves most of the unit idle.  The split is a FIXED partition, so the
 	// summation order is still identical on every run and at every thread count.
+	//
+	// Blocked over j on top of that: DN_GRAM_BLOCK columns share one pass over
+	// row i, so row i is read once per block instead of once per j.  That is
+	// where the time went -- blocking alone is 35% of the whole run at 138x343,
+	// while the float rows it feeds on are worth 11% with it and nothing without.
+	//
+	// Neither is a numerics change.  The rows widen back to double here, and
+	// since they were copied from a float32 image the widened value IS the value
+	// a double array would have held; blocking only interleaves independent dot
+	// products, leaving the four accumulators and the fixed partition inside each
+	// one untouched.  So the output is bit-identical -- asserted against a
+	// preserved binary on 80 M voxels, not assumed.
 	for (int i = 0; i < n; i++) {
-		const double *a = w->pt + (size_t)i * m;
-		for (int j = i; j < n; j++) {
-			const double *b = w->pt + (size_t)j * m;
+		const float *a = w->pt + (size_t)i * m;
+		int j = i;
+		for (; j + DN_GRAM_BLOCK <= n; j += DN_GRAM_BLOCK) {
+			const float *b[DN_GRAM_BLOCK];
+			double s[DN_GRAM_BLOCK][4] = {{0.0}};
+			for (int q = 0; q < DN_GRAM_BLOCK; q++) b[q] = w->pt + (size_t)(j + q) * m;
+			int v = 0;
+			for (; v + 3 < m; v += 4) {
+				const double x0 = a[v], x1 = a[v + 1], x2 = a[v + 2], x3 = a[v + 3];
+				for (int q = 0; q < DN_GRAM_BLOCK; q++) {
+					s[q][0] += x0 * (double)b[q][v];
+					s[q][1] += x1 * (double)b[q][v + 1];
+					s[q][2] += x2 * (double)b[q][v + 2];
+					s[q][3] += x3 * (double)b[q][v + 3];
+				}
+			}
+			for (; v < m; v++) {
+				const double x = a[v];
+				for (int q = 0; q < DN_GRAM_BLOCK; q++) s[q][0] += x * (double)b[q][v];
+			}
+			for (int q = 0; q < DN_GRAM_BLOCK; q++) {
+				const double acc = (s[q][0] + s[q][1]) + (s[q][2] + s[q][3]);
+				w->gram[(size_t)i * n + j + q] = acc;
+				w->gram[(size_t)(j + q) * n + i] = acc;
+			}
+		}
+		for (; j < n; j++) {
+			const float *b = w->pt + (size_t)j * m;
 			double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
 			int v = 0;
 			for (; v + 3 < m; v += 4) {
-				a0 += a[v] * b[v];
-				a1 += a[v + 1] * b[v + 1];
-				a2 += a[v + 2] * b[v + 2];
-				a3 += a[v + 3] * b[v + 3];
+				a0 += (double)a[v] * (double)b[v];
+				a1 += (double)a[v + 1] * (double)b[v + 1];
+				a2 += (double)a[v + 2] * (double)b[v + 2];
+				a3 += (double)a[v + 3] * (double)b[v + 3];
 			}
-			for (; v < m; v++) a0 += a[v] * b[v];
+			for (; v < m; v++) a0 += (double)a[v] * (double)b[v];
 			const double acc = (a0 + a1) + (a2 + a3);
 			w->gram[(size_t)i * n + j] = acc;
 			w->gram[(size_t)j * n + i] = acc;
@@ -323,11 +366,11 @@ int dn_denoise_voxel(const dn_geom *g, dn_work *w, const float *img,
 	if (rc) return rc;
 
 	double *yc = w->yc, *acc = w->acc;
-	const double *v = w->evecs;
 	for (int j = 0; j < n; j++) {
-		yc[j] = w->pt[(size_t)j * m + centre];
+		yc[j] = (double)w->pt[(size_t)j * m + centre];
 		acc[j] = 0.0;
 	}
+	const double *v = w->evecs;
 	for (int k = n - r; k < n; k++) {
 		double dot = 0.0;
 		for (int j = 0; j < n; j++) dot += yc[j] * v[(size_t)j * n + k];

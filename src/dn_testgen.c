@@ -7,12 +7,15 @@
 //
 //   dn_testgen mk  <kind> <out.nii>            write a fixture ("kind@" -> .hdr/.img pair)
 //   dn_testgen cmp <a.nii> <b.nii> <tol>       exit 0 if max|a-b| <= tol
+//   dn_testgen rl2 <a.nii> <b.nii> <tol>       exit 0 if rms(a-b)/rms(b) <= tol
 //   dn_testgen rms <file.nii> <want> <reltol>  exit 0 if the RMS still matches
 //
-// Fixtures are 9x9x3 x 8 volumes (the "mask" kind is a single volume),
-// deterministic, and every phase kind bar phase-siemens encodes the SAME
-// underlying phase, so any two of them must denoise to the same answer.
+// Fixtures are 9x9x3 x 8 volumes (the "mask" kind is a single volume, "big48" a
+// 9x9x5 x 48 one), deterministic, and every phase kind bar phase-siemens encodes
+// the SAME underlying phase, so any two of them must denoise to the same answer.
 
+#include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -140,16 +143,45 @@ static float *read_nii(const char *path, int *nvox) {
 	FILE *f = fopen(path, "rb");
 	if (!f) { perror(path); return NULL; }
 	nhdr1 h;
-	if (fread(&h, sizeof h, 1, f) != 1 || h.sizeof_hdr != 348 || h.datatype != 16) {
-		fprintf(stderr, "%s: not a float32 NIfTI-1 single file\n", path);
+	// float32 or the uint16 the rank map is written in; everything is widened to
+	// float here so one comparator serves both.
+	if (fread(&h, sizeof h, 1, f) != 1 || h.sizeof_hdr != 348 ||
+	    (h.datatype != 16 && h.datatype != 512)) {
+		fprintf(stderr, "%s: not a float32 or uint16 NIfTI-1 single file\n", path);
 		fclose(f); return NULL;
 	}
 	long n = 1;
 	for (int i = 1; i <= (h.dim[0] < 4 ? h.dim[0] : 4); i++) n *= (h.dim[i] > 0 ? h.dim[i] : 1);
+	// Bound BEFORE the (int) truncation at the end.  The dims are int16_t, so a
+	// crafted header reaches 32767^4; truncating that into *nvox can land on a
+	// negative count, and `cmp`'s `for (i = 0; i < na; i++)` then runs zero
+	// times and reports the two images identical.  A comparison that passes by
+	// doing nothing is worse than one that errors, so refuse instead.
+	if (n < 1 || n > INT_MAX) {
+		fprintf(stderr, "%s: implausible voxel count %ld\n", path, n);
+		fclose(f); return NULL;
+	}
+	// vox_offset is an unvalidated float straight out of the header, and casting
+	// a NaN or a huge value to long is undefined -- on arm64 it saturates to 0,
+	// which would read the header itself as voxel data and let a comparison pass
+	// on nonsense rather than erroring.  Same fail-open shape as the voxel-count
+	// bound above.
+	if (!(h.vox_offset >= 0.0f) || h.vox_offset > 1e9f) {
+		fprintf(stderr, "%s: implausible vox_offset %g\n", path, (double)h.vox_offset);
+		fclose(f); return NULL;
+	}
 	if (fseek(f, (long)h.vox_offset, SEEK_SET) != 0) { fclose(f); return NULL; }
 	float *d = (float *)malloc((size_t)n * sizeof(float));
 	if (!d) { fclose(f); return NULL; }
-	if (fread(d, sizeof(float), (size_t)n, f) != (size_t)n) {
+	if (h.datatype == 512) {
+		uint16_t *u = (uint16_t *)malloc((size_t)n * sizeof(uint16_t));
+		size_t got = u ? fread(u, sizeof(uint16_t), (size_t)n, f) : 0;
+		if (got != (size_t)n) {
+			fprintf(stderr, "%s: short read\n", path); free(u); free(d); fclose(f); return NULL;
+		}
+		for (long i = 0; i < n; i++) d[i] = (float)u[i];
+		free(u);
+	} else if (fread(d, sizeof(float), (size_t)n, f) != (size_t)n) {
 		fprintf(stderr, "%s: short read\n", path); free(d); fclose(f); return NULL;
 	}
 	fclose(f);
@@ -174,6 +206,30 @@ int main(int argc, char **argv) {
 		return (worst <= tol) ? 0 : 1;
 	}
 
+	// Relative L2, which is what an optimisation is judged on: a solver change
+	// moves every voxel by a little, and `cmp`'s maximum absolute difference
+	// cannot tell that from one voxel moving a lot.  Both are printed.
+	if (argc == 5 && !strcmp(argv[1], "rl2")) {
+		int na = 0, nb = 0;
+		float *a = read_nii(argv[2], &na), *b = read_nii(argv[3], &nb);
+		if (!a || !b) { free(a); free(b); return 2; }
+		if (na != nb) { fprintf(stderr, "different sizes: %d vs %d\n", na, nb); free(a); free(b); return 2; }
+		double sd = 0.0, sb = 0.0, worst = 0.0;
+		for (int i = 0; i < na; i++) {
+			const double d = (double)a[i] - (double)b[i];
+			if (fabs(d) > worst) worst = fabs(d);
+			sd += d * d;
+			sb += (double)b[i] * (double)b[i];
+		}
+		free(a); free(b);
+		// Reference scale from b, floored so an all-zero reference cannot divide
+		// by zero and report a clean 0 for two images that differ.
+		const double ref = sqrt(sb / na) > 0.0 ? sqrt(sb / na) : DBL_MIN;
+		const double rel = sqrt(sd / na) / ref;
+		printf("rel_l2 %.6g  max_abs %.6g\n", rel, worst);
+		return (rel <= atof(argv[4])) ? 0 : 1;
+	}
+
 	// A numerical anchor.  Every other comparison here pits the tool against
 	// itself under a different phase encoding, so a change to the ARITHMETIC --
 	// the binomial kernel, say -- shows up on both sides and cancels.  Pinning
@@ -195,6 +251,7 @@ int main(int argc, char **argv) {
 	if (argc != 4 || strcmp(argv[1], "mk")) {
 		fprintf(stderr, "usage: dn_testgen mk   <kind> <out.nii>\n"
 		                "       dn_testgen cmp  <a.nii> <b.nii> <tol>\n"
+		                "       dn_testgen rl2  <a.nii> <b.nii> <reltol>\n"
 		                "       dn_testgen rms  <file.nii> <expected> <reltol>\n");
 		return 2;
 	}
@@ -207,6 +264,18 @@ int main(int argc, char **argv) {
 	const int as_pair = (klen && kbuf[klen - 1] == '@');
 	if (as_pair) kbuf[--klen] = '\0';
 	const char *kind = kbuf;
+
+	// Three kinds build their own shape and return before the shared writer at
+	// the bottom, so the "@" pair form cannot apply to them.  Rejected HERE, once,
+	// before anything is allocated or written: the per-branch checks this replaced
+	// ran after the file had already been written, so a refused run exited 2 and
+	// still left an unrequested .nii behind -- and mask-wrongdim had no check at
+	// all, so it exited 0 having quietly written the single-file form instead.
+	if (as_pair && (!strcmp(kind, "big48") || !strcmp(kind, "phase-nan") ||
+	                !strcmp(kind, "mask-wrongdim"))) {
+		fprintf(stderr, "%s does not support the '@' pair form\n", kind);
+		return 2;
+	}
 
 	float *d = (float *)malloc(NVOX * sizeof(float));
 	if (!d) return 2;
@@ -252,6 +321,37 @@ int main(int argc, char **argv) {
 		rc = write_nii_dim(argv[3], d, NX - 2, NY, NZ, 1, vox);
 		free(d);
 		return rc;
+	} else if (!strcmp(kind, "big48")) {
+		// The only fixture that reaches the SPLIT eigensolver.  DN_SPLIT_MIN is 48,
+		// so 48 volumes is the smallest count that takes it: values-only tql2,
+		// inverse iteration on the tridiagonal, back-transform through the stored
+		// reflectors.  Every other fixture is 8 volumes and misses all of it.
+		//
+		// Auto extent is 5 (125 > 48), so M = 125 > N = 48 and nz must be at least
+		// 5.  A few smooth separable components on a bright background put the
+		// leading singular values above the noise floor, so the threshold retains
+		// some and dn_eig_vectors actually runs -- dimensions alone would leave it
+		// at rank 0, with the projection never entered.
+		//
+		// The NOISE is ramped across x while the components are not, so the retained
+		// rank falls as the weaker components drown.  A uniform rank map would be a
+		// near-worthless anchor: any change that still produced one constant would
+		// pass it.
+		const int bnz = 5, bnt = 48, bn3 = NX * NY * bnz;
+		float *b = (float *)malloc((size_t)bn3 * bnt * sizeof(float));
+		if (!b) { free(d); return 2; }
+		for (int t2 = 0; t2 < bnt; t2++)
+			for (int v = 0; v < bn3; v++) {
+				const double noise = 20.0 + 1980.0 * (double)(v % NX) / (double)(NX - 1);
+				double s = 1000.0;
+				for (int c = 1; c <= 3; c++)
+					s += (400.0 / c) * sin(0.13 * c * v + 0.31 * c * t2);
+				b[(size_t)t2 * bn3 + v] = (float)(s + noise * (rng((uint32_t)(t2 * bn3 + v)) - 0.5));
+			}
+		rc = write_nii_dim(argv[3], b, NX, NY, bnz, bnt, vox);
+		free(b);
+		free(d);
+		return rc;
 	} else if (!strcmp(kind, "phase-halfturns")) {
 		// Half-integer turns.  Under -phaseunits turns this gives exp(i*k*pi),
 		// i.e. a per-voxel factor of +1 or -1 -- a REAL sign modulation, not the
@@ -276,9 +376,6 @@ int main(int argc, char **argv) {
 		int ok2 = (fseek(f, sv_off, SEEK_SET) == 0) && (fwrite(&nan_v, 4, 1, f) == 1);
 		if (fclose(f) != 0) ok2 = 0;
 		free(d);
-		// This branch writes its own file, so the "@" pair form cannot apply.
-		// Say so rather than exiting 0 having written the wrong shape.
-		if (as_pair) { fprintf(stderr, "phase-nan does not support the '@' pair form\n"); return 2; }
 		return ok2 ? 0 : 1;
 	} else if (!strcmp(kind, "phase-const")) {
 		for (int i = 0; i < NVOX; i++) d[i] = 1234.0f;

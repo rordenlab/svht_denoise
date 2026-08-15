@@ -42,7 +42,7 @@
 // n*m blocks are what actually grow.
 static size_t worker_bytes(const dn_geom *g) {
 	const size_t n = (size_t)g->nvol, m = (size_t)g->m;
-	return (n * m + 4 * n * n) * sizeof(double);
+	return n * m * sizeof(float) + 4 * n * n * sizeof(double);
 }
 
 typedef struct {
@@ -52,7 +52,10 @@ typedef struct {
 	size_t total;
 	size_t chunk;
 	int failed;         // set by any worker that could not proceed
-	int eig_fail;       // count of eigensolver non-convergences
+	// unsigned long, matching `fallbacks` below: this is incremented once per
+	// FAILED voxel, and `total` is a size_t, so a signed int could in principle
+	// overflow on a volume large enough to exceed INT_MAX patches.
+	unsigned long eig_fail;   // count of eigensolver non-convergences
 	unsigned long fallbacks;  // eigenvector fallbacks (see dn_eig_fallbacks)
 } dn_pool;
 
@@ -89,7 +92,7 @@ static void *worker(void *arg) {
 	}
 
 	const int nx = g->nx, ny = g->ny;
-	int local_eig_fail = 0;
+	unsigned long local_eig_fail = 0;
 
 	for (;;) {
 		size_t lo, hi;
@@ -212,8 +215,8 @@ int dn_run_execute(const dn_run *r) {
 		return 1;
 	}
 	if (pool.eig_fail) {
-		dn_err("the eigensolver failed to converge for %d patch%s.\n",
-		       pool.eig_fail, pool.eig_fail == 1 ? "" : "es");
+		dn_err("the eigensolver failed to converge for %lu patch%s.\n",
+		       pool.eig_fail, pool.eig_fail == 1ul ? "" : "es");
 		dn_err("  Those voxels were left at zero rather than written from an\n");
 		dn_err("  unconverged basis. This should not happen; please report it.\n");
 		return 1;

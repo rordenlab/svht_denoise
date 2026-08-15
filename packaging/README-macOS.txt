@@ -6,11 +6,13 @@ default PATH, so it is ready to use immediately:
 
   svht_denoise
 
-The binary is universal (Apple Silicon and Intel). This build requires macOS 11
-or newer; the minimum is set at build time by MACOSX_DEPLOYMENT_TARGET. It is
-entirely self-contained: it links only against libSystem and libz, both of which
-ship with macOS. There is no folder to keep together and nothing
-else to download. You may copy it to any other Mac and it will run.
+The binary is for Apple Silicon (arm64). This build requires macOS 11 or newer;
+the minimum is set at build time by MACOSX_DEPLOYMENT_TARGET. It is entirely
+self-contained: it links only against libSystem, which ships with macOS, and
+statically embeds zlib-ng for reading and writing .nii.gz. There is no folder
+to keep together and nothing else to download. You may copy it to any other
+Apple Silicon Mac and it will run. On an Intel Mac, build from source instead:
+see the repository below.
 
 What it does
 ------------
@@ -44,9 +46,9 @@ The package is signed with a Developer ID Installer certificate and notarized by
 Apple. The notarization ticket is stapled to the package, so it validates with no
 network connection. To check for yourself:
 
-  pkgutil --check-signature svht_denoise-<version>-macos-universal.pkg
-  spctl --assess --type install --verbose=4 svht_denoise-<version>-macos-universal.pkg
-  xcrun stapler validate svht_denoise-<version>-macos-universal.pkg
+  pkgutil --check-signature svht_denoise-<version>-macos-arm64.pkg
+  spctl --assess --type install --verbose=4 svht_denoise-<version>-macos-arm64.pkg
+  xcrun stapler validate svht_denoise-<version>-macos-arm64.pkg
 
 The installed executable is signed with a Developer ID Application certificate.
 A notarization ticket cannot be stapled to a bare executable, so this checks the
@@ -65,3 +67,10 @@ Licence
 
 Mozilla Public License 2.0. See LICENSE in the source distribution at
 https://github.com/rordenlab/svht_denoise
+
+This binary statically embeds zlib-ng (https://github.com/zlib-ng/zlib-ng),
+(C) 1995-2024 Jean-loup Gailly and Mark Adler, used under the zlib licence. Its
+full text is in packaging/LICENSE-zlib-ng.txt in the source distribution. (A
+copy, not a pointer into third_party/zlib-ng/: that is a submodule, so it is an
+empty directory in a source tarball or a non-recursive clone -- which is exactly
+where someone goes looking for a licence.)

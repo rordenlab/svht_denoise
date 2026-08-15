@@ -8,14 +8,26 @@ The tool works on magnitude volumes, and on complex data when the phase is also 
 
 ## Building
 
-Requires a C99 compiler on a POSIX system (macOS, Linux, WSL) and zlib. The only other libraries are libm and pthreads, both standard on those platforms; there are no third-party dependencies.
+Requires a C99 compiler on a POSIX system (macOS, Linux, WSL), plus libm, pthreads and zlib — all standard on those platforms. On macOS the build supplies its own zlib (see below), so only libm and pthreads come from the system.
 
 ```
-git clone https://github.com/rordenlab/svht_denoise
+git clone --recursive https://github.com/rordenlab/svht_denoise
 cd svht_denoise/src
 make
 make test     # optional: regression tests, no dependencies
 ```
+
+`--recursive` fetches [zlib-ng](https://github.com/zlib-ng/zlib-ng), the one bundled dependency, pinned to an exact commit. On macOS `make` builds it and links it statically, which is roughly **3× faster at writing `.nii.gz`** — deflate is the largest serial block in a compressed run — and leaves the binary with no `libz` dependency at all. Reading is unchanged; inflate was never the bottleneck.
+
+Nothing breaks without it. A plain `git clone` leaves the submodule empty, and a build path containing a space — or any character outside letters, digits, dot, underscore and hyphen — defeats zlib-ng's own build; either way the build falls back to the system zlib and prints which one it used, and why:
+
+```
+make ZLIBNG=0                 # force the system zlib
+make ZLIBNG_ROOT=<dir>        # use a prebuilt ZLIB_COMPAT zlib-ng tree
+git submodule update --init ../third_party/zlib-ng    # from src, after a plain clone
+```
+
+Elsewhere the system zlib is the default, since this was measured only on Apple Silicon; `ZLIBNG_ROOT` still works there if you want it.
 
 This writes the `svht_denoise` executable into `src`. Run `./svht_denoise -help` for the full list of options.
 
@@ -23,6 +35,10 @@ This writes the `svht_denoise` executable into `src`. Run `./svht_denoise -help`
 ./svht_denoise dwi.nii.gz denoised.nii.gz
 ./svht_denoise dwi.nii.gz denoised.nii.gz -mask brain.nii.gz -noise sigma.nii.gz
 ```
+
+## Usage
+
+The `-help` option provides full usage details. In general, this tool behaves similarly to MRtrix dwidenoise and therefore has similar options and considerations. For example with regards to [patch size](https://mrtrix.readthedocs.io/en/latest/dwi_preprocessing/denoising.html#patch-size).
 
 ## Complex data
 
@@ -44,7 +60,7 @@ Only the phase *scale* has to be right; any constant offset is removed along wit
 
 The middle row is the rule the reference implementation uses, and it is correct for **any** encoding that covers a whole turn — scanner integers (Siemens writes -4096..4094), degrees, cycles, [-1, 1] — without needing to know which of them it is. Every acquired phase image covers a turn, because its background is noise whose phase is uniform over the circle.
 
-It is wrong for data that does *not* cover a turn, and no amount of cleverness fixes that: a range of [-0.5, 0.5] is either half a radian or one whole cycle, and nothing in the file says which. For that case, say so — `-phaseunits radians|degrees|turns` skips the inference entirely:
+It is wrong for data that does *not* cover a turn, and no amount of cleverness fixes that: a range of [-0.5, 0.5] is either half a radian or one whole cycle, and nothing in the file says which. For that case, say so — `-phaseunits radians|degrees|turns` (`cycles` is a synonym for `turns`; `auto` is the default) skips the inference entirely:
 
 ```
 ./svht_denoise mag.nii.gz denoised.nii.gz -phase phase.nii.gz -phaseunits radians
@@ -56,11 +72,13 @@ The rotation removes the per-voxel static background phase, taken from the first
 
 That residual +43.8 is not a bug and is not removable by this method: the phase estimate is derived from the data, so each noise sample is partly rotated onto the alignment of its own neighbourhood. The reference MRtrix3 pipeline leaves the same bias — 43.6 against 43.8 on the rotated series, and 43.37 against 43.41 after denoising.
 
-The rotation is serial, so it adds about 0.3 s of wall clock to a 3.0 s run (~10%) while being only ~2% of total CPU time. It costs rather more memory: a float32 copy of the phase series plus a fixed set of 3D scratch volumes, taking peak RSS on the sample data from 127 to 210 MiB.
+The rotation is serial, so it adds about 0.37 s of wall clock to a 2.1 s run (~18%) while being only ~2.7% of total CPU time — the gap between those two figures is why a single wall-clock sample badly misjudges it. It costs rather more memory: a float32 copy of the phase series plus a fixed set of 3D scratch volumes, taking peak RSS on the sample data from 127 to 211 MiB.
 
 ## macOS release packages
 
-A signed, notarized, stapled installer can be built from `src`. It installs a universal (Apple Silicon and Intel) binary into `/usr/local/bin`, targets macOS 11 or newer, and links only against libSystem and libz.
+A signed, notarized, stapled installer can be built from `src`. It installs an Apple Silicon (arm64) binary into `/usr/local/bin`, targets macOS 11 or newer, and links only against libSystem — zlib-ng is embedded statically, so there is no `libz` dependency. The packaging script refuses to build without the zlib-ng submodule, and separately proves the static link happened by checking that the finished binary does not name `libz` at all; the system-zlib fallback that is right for a working copy would otherwise ship silently, being ~3× slower with nothing about the binary to say so.
+
+Releases are arm64 only. This is a compute-bound tool, and the Intel Macs a universal build would have served are the slowest machines that could run it — on a platform macOS 26 is the last release to support. Building from source on an Intel Mac is unaffected: a plain `make` produces a native binary there as it always did. Cutting a *release* does require an Apple Silicon host, because the packaging script runs the test suite against the arm64 binary it builds; it says so and stops before building if run elsewhere. The installer itself declares `hostArchitectures="arm64"`, so an Intel Mac refuses it rather than installing a binary that cannot run.
 
 Store the notarization credentials once per machine — this prompts for an [app-specific password](https://appleid.apple.com), not your Apple ID password:
 
@@ -72,14 +90,14 @@ Then build a release. Two *different* certificates are needed, both from the sam
 
 ```
 make macos-release \
-  VERSION=1.1.0 \
+  VERSION=0.1.20260808 \
   MACOS_SIGN_IDENTITY='Developer ID Application: Your Name (ABCDE12345)' \
   MACOS_INSTALLER_IDENTITY='Developer ID Installer: Your Name (ABCDE12345)'
 ```
 
-That checks the credentials actually authenticate before doing any work, then builds, runs the full test suite, signs, packages, notarizes, staples and verifies — writing to `dist/`. The binary that ships is the one the tests ran against: the build and the suite happen in a single `make` invocation, so a stale or differently-configured binary cannot be substituted between them. The suite exercises the host slice of the universal binary; the other slice is compiled and signed but not executed. `security find-identity -v` lists your identities.
+That checks the credentials actually authenticate before doing any work, then builds, runs the full test suite, signs, packages, notarizes, staples and verifies — writing to `dist/`. The binary that ships is the one the tests ran against: the build and the suite happen in a single `make` invocation, so a stale or differently-configured binary cannot be substituted between them. With a single arm64 slice, the suite exercises exactly the code that ships — the universal build could only ever test the host slice and signed the other one unexecuted. `security find-identity -v` lists your identities.
 
-For local testing without certificates, `make macos-pkg-adhoc` produces an unsigned package; Gatekeeper will refuse it on another machine. `scripts/verify_macos_pkg.sh <pkg>` checks a package without installing it — signature, architectures, that nothing outside `/usr/lib` and `/System` is linked, and that the binary runs. That last check *runs* the packaged executable, so use it on packages you built, not on one from an untrusted source.
+For local testing without certificates, `make macos-pkg-adhoc` produces an unsigned package; Gatekeeper will refuse it on another machine. `scripts/verify_macos_pkg.sh <pkg>` checks a package without installing it — signature, that nothing outside `/usr/lib` and `/System` is linked, and that the binary runs; it reports the architectures rather than asserting them, since the arm64-only gate runs in `package_macos.sh` before anything is signed. That last check *runs* the packaged executable, so use it on packages you built, not on one from an untrusted source.
 
 ## Licensing
 
@@ -92,6 +110,8 @@ The underlying algorithm for optimal singular value hard thresholding (SVHT) is 
  - Prior Work: Applying random matrix theory to denoise diffusion MRI was established by Veraart, Novikov, Fieremans and colleagues (2016), whose [dwidenoise](https://mrtrix.readthedocs.io/en/dev/reference/commands/dwidenoise.html) remains the reference implementation and the benchmark this tool is measured against. svht_denoise is an independent implementation of a different estimator, and shares no code with it: dwidenoise fits the Marchenko-Pastur distribution to the patch eigenspectrum to estimate the noise level sigma, which then sets the cutoff, whereas svht_denoise applies the Gavish and Donoho hard threshold directly, at omega(beta) times the median singular value, so the noise level never enters the retain-or-discard decision. An estimate is still available on request: the optional `-noise` map reports sigma = y_med / sqrt(M * mu_beta), Equation 26 of the paper, but it is derived after the fact and does not influence the denoised output.
 
 This executable and its source code are licensed under the Mozilla Public License 2.0 (MPL-2.0), matching the permissive license used by the core MRtrix3 codebase. Note that dwidenoise itself is not covered by that permissive license: it carries an additional notice from New York University and the University of Antwerp restricting it to non-commercial research and excluding clinical care. svht_denoise carries no such restriction.
+
+The macOS release binary statically embeds [zlib-ng](https://github.com/zlib-ng/zlib-ng), © 1995-2024 Jean-loup Gailly and Mark Adler, under the zlib licence — permissive and compatible with MPL-2.0 §3.3. Its text is in [packaging/LICENSE-zlib-ng.txt](packaging/LICENSE-zlib-ng.txt). A `make ZLIBNG=0` build links the system zlib instead and embeds nothing.
 
 ## Benchmarking
 
@@ -106,14 +126,33 @@ Run these from `src`, after `mkdir -p ../benchmark/svht_denoise ../benchmark/dwi
 /usr/bin/time -l dwidenoise ../benchmark/input/dwi.nii.gz ../benchmark/dwidenoise/dwi1.nii.gz -nthreads 1
 ```
 
+And, from the repository root, with a Python environment that has DIPY (`mkdir -p benchmark/dipy` first):
+
+```
+/usr/bin/time -l python3 benchmark/dipy_mppca.py benchmark/input/dwi.nii.gz benchmark/dipy/dwi.nii.gz
+```
+
 Here are findings for an Apple MacBook with M4 Pro CPU (14 core, 10 performance). Time is elapsed wall clock, and peak RAM is the maximum resident set size, both as reported by `/usr/bin/time -l`.
+
+The `svht_denoise` rows are the default macOS build, with the bundled static zlib-ng, and are the median of five runs (spread 1650-1680 ms and 14070-14260 ms respectively). Since which zlib went in changes the wall clock and nothing else, a timing is only comparable to another taken with the same one — `make` prints which it used. The `dwidenoise` rows are unchanged and were measured in an earlier session.
+
+Note how differently the two rows moved: zlib-ng took 430 ms off the 14-thread run (2080 → 1650, a 21% saving) but only ~650 ms off the single-threaded one (14750 → 14100, about 4%). Compression is serial either way, so it is a large share of the wall clock only once the denoise itself is spread across cores — which is also why it was worth fixing.
+
+The `dipy mppca` row is DIPY 1.11.0 on Python 3.12 (NumPy 2.1.3), median of three runs, at `patch_radius=2` — a 5x5x5 window, the same patch the other two use here. It has no thread option and uses one core (user time equals wall clock), so there is no 14-thread row for it; the figure is whole-process, of which interpreter startup and imports are 0.3 s. It is the closest algorithmic comparison to `dwidenoise` rather than to this tool: both are Marchenko-Pastur PCA, and svht_denoise is a different estimator. The memory is the more interesting column — DIPY works in float64 on the whole series, where the two C tools stream float32.
 
 | Method       | Threads | Time (ms) | Peak RAM (MiB) |
 | ------------ | ------- | --------- | ------------- |
-| svht_denoise |      14 |      2080 |           152 |
-| svht_denoise |       1 |     14750 |           150 |
+| svht_denoise |      14 |      1650 |           152 |
+| svht_denoise |       1 |     14100 |           151 |
 | dwidenoise   |      14 |      1950 |           228 |
 | dwidenoise   |       1 |     11620 |           226 |
+| dipy mppca   |       1 |     59590 |           849 |
+
+**That table predates a round of internal optimisation and has not been re-measured.** Measured before-and-after in one sitting on this same bundled series, at 14 threads and median of five alternating rounds, that work went from 1.79 s to 1.50 s of wall clock (-16%) and from 19.69 s to 16.01 s of CPU time (-19%), with peak RSS unchanged at 152 MiB. Those absolute times are not comparable with the table's 1650 ms — different sitting, different conditions — which is why the rows are left as they were measured rather than partially updated. Re-measuring all three tools in one sitting is still outstanding.
+
+The saving grows with the series. On a 100x100x58 series of 138 volumes at 7x7x7 (not in this repository, same 14 threads, mains power, quiet machine, median of five alternating rounds) the same change reads 94.66 s to 58.67 s of wall clock (-38%) and 1220.96 s to 726.46 s of CPU (-40%), peak RSS 778.1 to 775.5 MiB. Nothing about the interface or the output format changed. One of those changes does move values — a local `hypot` in the eigensolver's QL inner loop — at 2.24e-10 relative L2 error on that series, with the rank map byte-identical.
+
+`scripts/bench.sh <input> <output> <binary>...` produced those figures. It alternates candidates and reverses their order every other round so neither sits in the same thermal position twice, reports the median of the rounds, and refuses to time at all on a loaded machine, on battery, or in Low Power Mode — battery alone was measured at 2x, and nothing in the numbers afterwards says which state a timing was taken in.
 
 ## Links
 

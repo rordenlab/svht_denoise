@@ -21,7 +21,7 @@
 #include "dn_phase.h"
 #include "dn_run.h"
 
-#define DN_VERSION "1.1.0"
+#define DN_VERSION "0.1.20260808"
 
 static void usage(void) {
 	printf("svht_denoise %s -- DWI denoising by optimal singular value hard thresholding\n", DN_VERSION);
@@ -305,7 +305,11 @@ int main(int argc, char *argv[]) {
 	// testing the enum would let that one spelling slip past the check below
 	// while every other spelling was rejected.
 	int punits_given = 0;
-	int extent = 0, nthreads = 0, quiet = 0;
+	// extent_given, rather than `extent != 0`, is what separates "not supplied"
+	// from "supplied as 0".  Sharing 0 for both meant an explicit `-extent 0`
+	// silently selected the automatic size and reported it as "(auto)", while
+	// every other value the help text calls invalid -- 2, -1 -- was rejected.
+	int extent = 0, extent_given = 0, nthreads = 0, quiet = 0;
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
@@ -344,6 +348,7 @@ int main(int argc, char *argv[]) {
 			}
 			else if (!strcmp(a, "-extent")) {
 				if (parse_int(v, &extent)) { dn_err("-extent needs an integer (got '%s')\n", v); return EXIT_FAILURE; }
+				extent_given = 1;
 			} else if (!strcmp(a, "-nthreads") || !strcmp(a, "-p")) {
 				if (parse_int(v, &nthreads) || nthreads < 1) {
 					dn_err("-nthreads needs a positive integer (got '%s')\n", v);
@@ -417,8 +422,8 @@ int main(int argc, char *argv[]) {
 	                          img.nifti_type)) goto done;
 
 	const int auto_extent = dn_auto_extent(img.nvol);
-	const int extent_was_auto = (extent == 0);
-	if (extent == 0) {
+	const int extent_was_auto = !extent_given;
+	if (!extent_given) {
 		extent = auto_extent;
 		if (extent == 0) {
 			dn_err("no patch size up to %d fits %d volumes (needs k^3 > N)\n",

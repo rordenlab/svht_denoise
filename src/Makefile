@@ -12,7 +12,9 @@
 #   make distclean   also sweep .dSYM bundles
 #   make macos-release   signed, notarized, stapled .pkg (see the section below)
 #
-# The only dependency beyond libm and pthreads is zlib, for .nii.gz via nifti_io.
+# The only dependency beyond libm and pthreads is zlib, for .nii.gz via nifti_io;
+# on macOS that is the bundled static zlib-ng by default -- see the zlib-ng
+# section below for how to turn it off or point it elsewhere.
 #
 # There is deliberately NO -ffast-math anywhere.  This code validates finite
 # values and promises byte-identical output across thread counts; reassociation
@@ -20,7 +22,7 @@
 
 CC      ?= cc
 OPT     ?= -O3
-STD      = -std=c99
+override STD = -std=c99
 WARN     = -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith
 # `override` so these survive a command-line assignment.  Without it,
 # `make DEFS=-DNOTHING` silently drops the feature macros and HAVE_ZLIB, which
@@ -51,8 +53,101 @@ endif
 # intended.
 CFLAGS    = $(OPT) $(WARN)
 override REQ_CFLAGS = $(STD)
-ALL_CFLAGS = $(REQ_CFLAGS) $(CFLAGS) $(DEFS) $(CPPFLAGS)
-LDLIBS   = -lm -lz -lpthread
+
+# ------------------------------------------------------------------ zlib-ng
+#
+# Writing .nii.gz is deflate-bound, and deflate is the largest serial block in a
+# gz->gz run: ~0.9 s of a 2.4 s run on 104x104x72x21, single-threaded, while
+# every other core idles.  zlib-ng compresses the same data ~2.9x faster than
+# the system zlib 1.2.12 (0.23 s against 0.66 s for 77 MB) and produces a
+# slightly SMALLER file, so there is no size/speed trade to weigh.  READING is
+# unaffected -- inflate already runs at over 1 GB/s and was never the
+# bottleneck.  Measured end to end: 2.13 s -> 1.68 s.
+#
+# On macOS it is therefore the default, linked STATICALLY, which also leaves the
+# shipped binary with no libz dependency at all.  Sourced from the
+# third_party/zlib-ng submodule pinned to an exact commit, so a given revision
+# of this repo always produces the same binary.
+#
+#   make ZLIBNG=0              force the system -lz
+#   make ZLIBNG=1              force zlib-ng (also enables it off macOS)
+#   make ZLIBNG_ROOT=<dir>     use a prebuilt ZLIB_COMPAT tree instead
+#
+# A NON-recursive clone leaves the submodule directory empty.  That falls back
+# to the system -lz rather than failing, and `make` says which one it used --
+# the difference is speed, not behaviour, and refusing to build a working tool
+# over it would be worse.  Populate it with, from this directory:
+#   git submodule update --init ../third_party/zlib-ng
+#
+# ZNG_SRC and ZNG_BUILD are RELATIVE, and that is load-bearing rather than tidy.
+# Both appear as make targets and prerequisites, and make separates those on
+# whitespace, so an absolute path is unusable the moment the checkout lives at
+# "/Users/me/My Project" -- `rm -rf $(ZNG_BUILD)` in `clean` then expanded to
+# two arguments and DELETED "/Users/me/My".  Demonstrated, with a canary file.
+# Quoting the shell uses is not a fix, because a target containing a space
+# cannot be written in a makefile at all.  Relative paths sidestep it entirely:
+# make always runs in src/, and neither ".zlibng" nor "../third_party/zlib-ng"
+# can contain a space no matter where the repository sits.
+ZNG_SRC   := ../third_party/zlib-ng
+ZNG_BUILD := .zlibng
+ZLIBNG    ?= $(if $(filter Darwin,$(UNAME_S)),1,0)
+# Reject any other value rather than treating it as "off".  The gate used to be
+# `ZLIBNG` equal to the literal `auto`, so `ZLIBNG=1` -- the obvious way to ask
+# for it -- silently selected the SYSTEM zlib, and silently is the whole problem:
+# the result still builds, still passes, and is only ~3x slower at writing.
+ifeq ($(filter 0 1,$(ZLIBNG)),)
+  $(error ZLIBNG must be 0 or 1 (got '$(ZLIBNG)'))
+endif
+
+ifdef ZLIBNG_ROOT
+  # Prebuilt tree: must be a ZLIB_COMPAT build (drop-in libz.a + zlib.h).  The
+  # packaged zlib-ng builds (Homebrew, distros) are NOT compat -- they install a
+  # zng_-prefixed zlib-ng.h -- so they cannot satisfy nifti_io's <zlib.h>.
+  ZNG_LIB := $(firstword $(wildcard $(ZLIBNG_ROOT)/libz.a $(ZLIBNG_ROOT)/lib/libz.a))
+  ZNG_INC := $(dir $(firstword $(wildcard $(ZLIBNG_ROOT)/zlib.h $(ZLIBNG_ROOT)/include/zlib.h)))
+  ifeq ($(ZNG_LIB),)
+    $(error ZLIBNG_ROOT is set but no libz.a under $(ZLIBNG_ROOT) or $(ZLIBNG_ROOT)/lib -- run ./configure --zlib-compat && make there)
+  endif
+  ifeq ($(ZNG_INC),)
+    $(error ZLIBNG_ROOT is set but no zlib.h under $(ZLIBNG_ROOT) or $(ZLIBNG_ROOT)/include -- use the same ZLIB_COMPAT build for headers and libz.a)
+  endif
+else ifeq ($(ZLIBNG),1)
+  # Our own paths are relative and so immune to the checkout location, but
+  # zlib-ng's build is NOT: its configure resolves an absolute SRCDIR and pastes
+  # it unquoted into its generated recipes.  A space merely breaks it ("No rule
+  # to make target arch/generic/adler32_c.o"), but a shell metacharacter is
+  # executed -- a directory named with backticks around a command ran that
+  # command, demonstrated with a canary.  A CI checkout path derived from a
+  # branch or tag name is the realistic way that becomes someone else's input.
+  # So the test is an ALLOW-LIST of characters known to survive being pasted
+  # into a recipe, not a hunt for the ones that do not, and anything else is
+  # treated exactly like a missing submodule: fall back, say why, keep building.
+  # Checking the shell's $$PWD rather than $(CURDIR) so the value is never make
+  # syntax either.  Upstream's quoting is not ours to fix.
+  ZNG_PATH_OK := $(shell case "$$PWD" in (*[!A-Za-z0-9._/-]*) echo no;; (*) echo yes;; esac)
+  ifneq ($(ZNG_PATH_OK),yes)
+    ZNG_SKIP := unsafe character in the build path
+  else ifeq ($(wildcard $(ZNG_SRC)/configure),)
+    ZNG_SKIP := submodule not checked out
+  else
+    ZNG_LIB   := $(ZNG_BUILD)/libz.a
+    ZNG_INC   := $(ZNG_BUILD)
+  endif
+endif
+
+ifeq ($(ZNG_LIB),)
+  ZLIB_LIB    = -lz
+  ZLIB_WHICH  = system zlib$(if $(ZNG_SKIP), -- zlib-ng skipped: $(ZNG_SKIP))
+else
+  # zlib-ng's configure GENERATES zlib.h and zconf.h into the build directory,
+  # so the include path is the build tree, not the source tree.
+  ZLIB_CFLAGS = -I$(ZNG_INC)
+  ZLIB_LIB    = $(ZNG_LIB)
+  ZLIB_WHICH  = zlib-ng (static)
+endif
+
+ALL_CFLAGS = $(REQ_CFLAGS) $(CFLAGS) $(DEFS) $(ZLIB_CFLAGS) $(CPPFLAGS)
+LDLIBS   = -lm $(ZLIB_LIB) -lpthread
 
 # .nii.gz support is compiled into nifti_io only when HAVE_ZLIB is defined; without
 # it every compressed read fails at run time with a "recompile for compressed data"
@@ -61,7 +156,10 @@ override DEFS += -DHAVE_ZLIB
 
 # nifti_io.c is vendored verbatim and is not ours to tidy; build it without the
 # strict warning set so a clean build stays meaningful for the code we own.
-NIFTI_CFLAGS = $(REQ_CFLAGS) $(OPT) -w $(DEFS) $(CPPFLAGS)
+# ZLIB_CFLAGS must be here too: nifti_io.c is the translation unit that actually
+# includes <zlib.h>, so leaving it out builds the compressed path against the
+# SYSTEM header while linking zlib-ng's library.
+NIFTI_CFLAGS = $(REQ_CFLAGS) $(OPT) -w $(DEFS) $(ZLIB_CFLAGS) $(CPPFLAGS)
 
 # `force` below is the first real target in the file, which would otherwise
 # become the default goal; say what the default is instead of relying on order.
@@ -96,7 +194,12 @@ BIN     = svht_denoise
         macos-pkg-adhoc macos-pkg macos-notarize macos-notary-profile \
         macos-release check-notary-profile distclean
 
+# The echo lives HERE, not in the $(BIN) recipe, so it prints on an
+# already-built tree as well as a fresh one.  That is the state you are in right
+# before a benchmark, which is precisely when you need to know which library
+# went in -- and in the link recipe it printed nothing at all.
 all: $(BIN)
+	@echo "  $(BIN): compression via $(ZLIB_WHICH)"
 
 # Regression tests for the cases that were once silent-failure bugs.  The fixture
 # generator is deliberately standalone -- it writes NIfTI by hand rather than
@@ -111,11 +214,55 @@ $(TESTGEN): dn_testgen.c $(FLAGSTAMP)
 test: $(BIN) $(TESTGEN)
 	@BIN=./$(BIN) GEN=./$(TESTGEN) sh test.sh
 
-$(BIN): $(OBJS) $(MAIN) $(NIFTI)
-	$(CC) $(ALL_CFLAGS) -o $@ $^ $(LDLIBS)
+# Say which zlib went in.  The two differ in .nii.gz WRITE speed by about 3x, so
+# silently falling back to the system one -- which is what a non-recursive clone
+# does -- would otherwise look like the tool had simply got slower.
+# `$(filter %.o,$^)`, not `$^`: the zlib-ng archive is a prerequisite so that
+# rebuilding it relinks, but it reaches the link line through $(LDLIBS).  Passing
+# $^ wholesale listed it twice and drew "ld: warning: ignoring duplicate
+# libraries", and a warning nobody can fix is how a build stops being read.
+$(BIN): $(OBJS) $(MAIN) $(NIFTI) $(ZNG_LIB)
+	$(CC) $(ALL_CFLAGS) -o $@ $(filter %.o,$^) $(LDLIBS)
 
-$(NIFTI): nifti_io.c nifti_io.h $(FLAGSTAMP)
+# $(ZNG_LIB) is a prerequisite of BOTH rules above, not just a link input.  For
+# this one because zlib-ng's configure is what GENERATES zlib.h, so nifti_io.c
+# -- the only translation unit that includes it -- cannot be compiled before
+# configure has run, and must be recompiled when the header changes underneath
+# it.  Empty when the system zlib is in use, so it costs nothing there.
+$(NIFTI): nifti_io.c nifti_io.h $(FLAGSTAMP) $(ZNG_LIB)
 	$(CC) $(NIFTI_CFLAGS) -c -o $@ nifti_io.c
+
+# Ties the archive to the submodule's CHECKED-OUT REVISION.  Without it the
+# archive has no prerequisites at all, so `git submodule update` to a different
+# commit silently relinks the PREVIOUS library: the pinned-revision
+# reproducibility this whole arrangement exists for would hold for releases,
+# which start with `make clean`, and quietly not hold for ordinary builds and
+# benchmarks.  Same rewrite-only-when-it-changes trick as $(FLAGSTAMP), for the
+# same reason.  `no-git` when git is unavailable, as in an exported tarball.
+# Kept OUTSIDE $(ZNG_BUILD) so the recipe below can delete that directory
+# wholesale without destroying its own prerequisite.
+ZNG_REV := .zlibng-rev
+$(ZNG_REV): force
+	@rev=`git -C $(ZNG_SRC) rev-parse HEAD 2>/dev/null || echo no-git`; \
+	if [ "`cat $@ 2>/dev/null`" != "$$rev" ]; then printf '%s' "$$rev" > $@; fi
+
+# Wipes the build directory first, so a revision change gives a FROM-SCRATCH
+# build.  Re-running configure over the old tree would leave objects belonging
+# to the previous revision and rebuild only those whose sources moved, which is
+# not the same thing as "this commit produces this binary" -- and that claim is
+# the entire reason the submodule is pinned.  This is why $(ZNG_REV) lives
+# outside the directory: the recipe would otherwise delete its own prerequisite.
+# `cd`s into the build directory, so the source path needs one more `../`.
+$(ZNG_BUILD)/libz.a: $(ZNG_REV)
+	@echo "  building zlib-ng (submodule, static)"
+	@rm -rf $(ZNG_BUILD) && mkdir -p $(ZNG_BUILD)
+	@cd $(ZNG_BUILD) && ../$(ZNG_SRC)/configure --zlib-compat --static >config.log 2>&1 || { \
+		echo "zlib-ng configure failed; last 20 lines of $(ZNG_BUILD)/config.log:" >&2; \
+		tail -20 config.log >&2; exit 1; }
+	@$(MAKE) --no-print-directory -C $(ZNG_BUILD) libz.a >$(ZNG_BUILD)/build.log 2>&1 || { \
+		echo "zlib-ng build failed; last 20 lines of $(ZNG_BUILD)/build.log:" >&2; \
+		tail -20 $(ZNG_BUILD)/build.log >&2; exit 1; }
+	@touch $@
 
 # -MMD -MP makes the compiler emit each object's header dependencies, so editing
 # dn.h or dn_eig.h rebuilds what includes it.  Without this the pattern rule
@@ -162,14 +309,14 @@ verbose:
 # ---------------------------------------------------------------- macOS release
 #
 #   make macos-notary-profile APPLE_ID='you@example.com' TEAM_ID='ABCDE12345'
-#   make macos-release VERSION=1.1.0 \
+#   make macos-release VERSION=<version> \
 #        MACOS_SIGN_IDENTITY='Developer ID Application: Name (TEAMID)' \
 #        MACOS_INSTALLER_IDENTITY='Developer ID Installer: Name (TEAMID)'
 #
 # The profile is stored once per machine; the release step builds, tests, signs,
 # packages, notarises, staples and verifies. `make macos-pkg-adhoc` is the
 # unsigned local-testing path.
-VERSION ?= 1.1.0
+VERSION ?= 0.1.20260808
 MACOS_SIGN_IDENTITY ?=
 MACOS_INSTALLER_IDENTITY ?=
 NOTARY_PROFILE ?= svht-denoise-notary
@@ -223,7 +370,7 @@ macos-pkg:
 	../scripts/package_macos.sh "$$VERSION"
 
 macos-notarize:
-	../scripts/notarize_macos.sh "../dist/svht_denoise-$$VERSION-macos-universal.pkg" "$$NOTARY_PROFILE"
+	../scripts/notarize_macos.sh "../dist/svht_denoise-$$VERSION-macos-arm64.pkg" "$$NOTARY_PROFILE"
 
 macos-notary-profile:
 	@case "$$NOTARY_PROFILE" in -*|"") \
@@ -239,7 +386,7 @@ macos-notary-profile:
 macos-release:
 	$(MAKE) check-notary-profile
 	$(MAKE) macos-pkg
-	../scripts/notarize_macos.sh "../dist/svht_denoise-$$VERSION-macos-universal.pkg" "$$NOTARY_PROFILE"
+	../scripts/notarize_macos.sh "../dist/svht_denoise-$$VERSION-macos-arm64.pkg" "$$NOTARY_PROFILE"
 
 # Ask notarytool, NOT `security find-generic-password`. `notarytool
 # store-credentials` writes to the data-protection keychain, while `security`
@@ -261,8 +408,16 @@ check-notary-profile:
 	}
 	@echo "notarization credentials found for profile '$$NOTARY_PROFILE'"
 
+# The zlib-ng build goes too, and that is deliberate rather than thorough.  It
+# carries a deployment target inherited from the environment at the time it was
+# configured, and package_macos.sh's first step is `make clean`: keeping a dev
+# build here would let a library configured for the host's macOS be linked into
+# a release that advertises 11.0.  The symptom is a wall of link warnings and an
+# executable whose own minos still reads 11.0, so the package check passes and
+# nothing fails.  Rebuilding it costs a couple of seconds.
 clean:
 	rm -f *.o *.d $(BIN) $(TESTGEN) $(FLAGSTAMP)
+	rm -rf $(ZNG_BUILD) $(ZNG_REV)
 
 # Debug builds leave a .dSYM bundle beside the binary; sweep it too.
 distclean: clean

@@ -1,5 +1,7 @@
-// NIfTI input/output.  This is the only file that knows about
-// nifti_io.h; everything else works on plain float32 buffers.
+// NIfTI input/output.  Almost the only file that knows about nifti_io.h;
+// everything else works on plain float32 buffers, with one exception --
+// dn_phase.c reads nim->sform_code / qform_code directly to decide whether a
+// world transform is present at all.
 
 #ifndef DN_NII_H
 #define DN_NII_H

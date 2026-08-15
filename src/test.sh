@@ -301,6 +301,91 @@ if "$GEN" cmp "$WORK/rot_c.nii" "$M" 0 >/dev/null 2>&1
 then ok "constant phase reproduces the magnitude exactly"
 else bad "constant phase altered the magnitude (max diff $("$GEN" cmp "$WORK/rot_c.nii" "$M" 0 2>/dev/null))"; fi
 
+echo "compressed I/O"
+# The .nii.gz path had NO coverage at all, which stopped being acceptable when
+# the default macOS build switched from the system zlib to a statically linked
+# zlib-ng: the whole suite passed either way, so nothing here would have noticed
+# the compression library changing underneath it -- or failing to.
+# The reference is "gz1plain", NOT "gz1.nii" beside "gz1.nii.gz", and the two
+# must never share a basename.  nifti_findimgname() resolves the data file by
+# stripping the extension and trying base+".nii" BEFORE base+".nii.gz", so with
+# matching names the read below took its header from the .gz and its voxels from
+# the plain sibling -- the comparison then ran two passes over identical bytes.
+# Measured: with the names matched, corrupting a byte in gzread OR in gzwrite
+# left the whole suite green; with them distinct, both are caught.
+check "write .nii.gz"           0 "$BIN" "$M" "$WORK/gz1.nii.gz" -quiet
+check "write .nii for reference" 0 "$BIN" "$M" "$WORK/gz1plain.nii"   -quiet
+# Exit 0 is NOT enough, and this is not hypothetical: built without HAVE_ZLIB
+# the tool returns success having created no .gz at all -- nifti_io rewrites the
+# name and writes the uncompressed file beside it.  Assert the requested path
+# exists before asserting anything about its contents.
+if [ -f "$WORK/gz1.nii.gz" ]
+then ok "the .gz output file exists"
+else bad "exit 0 but no .gz file was created"; fi
+# Actually a gzip stream, not an uncompressed file wearing a .gz name.
+if [ "$(od -An -tx1 -N2 < "$WORK/gz1.nii.gz" | tr -d ' \n')" = "1f8b" ]
+then ok "the .gz output is a real gzip stream"
+else bad "the .gz output has no gzip magic"; fi
+if [ "$(wc -c < "$WORK/gz1.nii.gz")" -lt "$(wc -c < "$WORK/gz1plain.nii")" ]
+then ok "the .gz output is smaller than the uncompressed one"
+else bad "the .gz output did not actually compress"; fi
+# Read both back THROUGH THE TOOL, so this needs no gzip(1) and stays honest on
+# any host: if the write or the read dropped or altered a byte, the two
+# second-pass results diverge.  Comparing the .gz against the .nii directly
+# would not work -- they are different file formats holding the same data.
+check "read .nii.gz back in"    0 "$BIN" "$WORK/gz1.nii.gz" "$WORK/gz2_c.nii" -quiet
+check "read .nii back in"       0 "$BIN" "$WORK/gz1plain.nii"    "$WORK/gz2_u.nii" -quiet
+if "$GEN" cmp "$WORK/gz2_c.nii" "$WORK/gz2_u.nii" 0 >/dev/null 2>&1
+then ok "compressed and uncompressed round trips agree exactly"
+else bad "the .gz round trip changed the data (max diff $("$GEN" cmp "$WORK/gz2_c.nii" "$WORK/gz2_u.nii" 0 2>/dev/null))"; fi
+
+echo "split eigensolver path"
+# Every fixture above is 8 volumes, which is below DN_SPLIT_MIN (48), so all of
+# them take the FULL solver.  This one is 48 -- the smallest count that takes the
+# split path: values-only tql2, inverse iteration on the tridiagonal, and the
+# back-transform through the stored reflectors.  Measured with llvm-cov: on the
+# 8-volume fixtures tred_reduce, tridiag_solve, tridiag_eigvec and tred_apply_q
+# have ZERO coverage, and on this one they have 81-92% while tred2 has none.
+# The two fixtures are complementary, which is why both stay.
+"$GEN" mk big48 "$WORK/big48.nii" || { echo "fixture big48 failed"; exit 1; }
+check "48-volume run" 0 "$BIN" "$WORK/big48.nii" "$WORK/b48.nii" -quiet -rank "$WORK/b48_r.nii"
+# Ranks are integers, so a NON-INTEGER rank-map RMS is by itself proof that the
+# map varies.  That matters: a run that retained nothing anywhere would exit 0
+# with dn_eig_vectors never entered, and one constant rank would satisfy any
+# anchor that still produced a constant.  Here the rank runs 3 to 7.
+if "$GEN" rms "$WORK/b48_r.nii" 5.74348799 1e-5 >/dev/null
+then ok "split-path rank map matches its recorded RMS"
+else bad "split-path rank map moved: $("$GEN" rms "$WORK/b48_r.nii" 0 0 2>/dev/null) vs 5.74348799"; fi
+if "$GEN" rms "$WORK/b48.nii" 1061.54322 1e-5 >/dev/null
+then ok "split-path denoised series matches its recorded RMS"
+else bad "split-path denoised RMS moved: $("$GEN" rms "$WORK/b48.nii" 0 0 2>/dev/null) vs 1061.54322"; fi
+# The byte-identity promise, on the path where the eigenvectors are built one at
+# a time and re-orthogonalised against their predecessors.  The 8-volume case
+# below never reaches that code.
+check "48-volume, 1 thread"      0 "$BIN" "$WORK/big48.nii" "$WORK/b48_t1.nii" -nthreads 1 -quiet
+# NOT -quiet, and the worker count is read back, for the same reason the
+# determinism section below does it: dn_effective_threads caps by DN_CHUNK-sized
+# chunks and by the core count, so on a one-core host "-nthreads 8" means 1 and
+# the comparison below would be a serial run against itself, reporting success.
+check "48-volume, many threads"  0 "$BIN" "$WORK/big48.nii" "$WORK/b48_t8.nii" -nthreads 8
+sv_n=$(sed -n 's/.*threads *: *//p' "$WORK/stderr")
+if [ "${sv_n:-1}" -gt 1 ]
+then ok "the multi-thread split run really used $sv_n workers"
+else bad "the split run used ${sv_n:-?} worker; the comparison below proves nothing"; fi
+if cmp -s "$WORK/b48_t1.nii" "$WORK/b48_t8.nii"
+then ok "split path is byte-identical across thread counts"; else bad "split path output depends on the thread count"; fi
+
+# dn_testgen's rl2 is the metric an optimisation is judged on, so its own
+# arithmetic needs pinning: it is twenty lines that could silently start
+# returning zero, and every use of it is a comparison it would then pass.
+if "$GEN" rl2 "$WORK/b48_t1.nii" "$WORK/b48_t8.nii" 0 >/dev/null 2>&1
+then ok "rl2 reports zero for identical images"
+else bad "rl2 reported a difference between identical images"; fi
+"$GEN" rl2 "$WORK/b48.nii" "$WORK/big48.nii" 1e-9 >/dev/null 2>&1; sv_rc=$?
+if [ "$sv_rc" -eq 1 ]; then ok "rl2 detects a real difference"
+elif [ "$sv_rc" -eq 0 ]; then bad "rl2 called a denoised series identical to its input"
+else bad "rl2 failed to run (exit $sv_rc)"; fi
+
 echo "determinism"
 # Byte-identical output across thread counts is a promise the project makes.
 # The worker count is READ BACK, not assumed.  dn_effective_threads caps by the

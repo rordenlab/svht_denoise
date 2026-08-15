@@ -33,7 +33,8 @@ int dn_run_execute(const dn_run *r);
 int dn_default_threads(void);
 
 // The team size that will ACTUALLY be used for this geometry: `requested`,
-// capped by the number of work chunks and by a scratch-memory budget.  Exposed
+// capped by the core count, by the number of work chunks, and by a scratch-memory
+// budget.  Exposed
 // so the CLI reports the effective count rather than the requested one.
 int dn_effective_threads(const dn_geom *g, size_t n_work, int requested);
 

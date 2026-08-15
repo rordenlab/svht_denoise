@@ -20,9 +20,10 @@ extern "C" {
 // the stream (niimath learned this the hard way -- see its printfx convention).
 #define dn_err(...)  do { fprintf(stderr, DN_NAME ": "); fprintf(stderr, __VA_ARGS__); } while (0)
 
-// Largest volume count the N x N dense solver will accept.  The Gram matrix and
-// eigenvector block are each N*N doubles per worker, so 4096 volumes would already
-// be 128 MB per thread; anything approaching this is a user error, not a workload.
+// Largest volume count the N x N dense solver will accept.  Several N*N double
+// blocks are held per worker -- dn_run.c's worker_bytes models four -- and one of
+// them alone is 128 MiB at 4096 volumes, so that many would already be half a
+// gigabyte per thread; anything approaching this is a user error, not a workload.
 #define DN_MAX_VOL 4096
 
 // Largest patch side length.  k = 15 is 3375 voxels, far past anything useful.

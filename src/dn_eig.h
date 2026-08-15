@@ -26,12 +26,14 @@ void dn_eig_free(dn_eig *e);
 // and leaves the others untouched; it must be called after dn_eig_values() with
 // the same workspace and no intervening solve.
 //
-// `a` is n*n, row-major, full symmetric storage, and ITS CONTENTS ARE DESTROYED.
+// `a` is n*n, row-major, full symmetric storage, and is READ ONLY -- it is
+// copied into the workspace before anything destroys it, which `const` enforces.
+//
 // evals comes back ASCENDING; evecs[i*n+j] is element i of the eigenvector for
 // evals[j], so eigenvectors are the COLUMNS.  Both return 0 on success and
 // non-zero on failure to converge -- callers must check, because a silently
 // unconverged basis would corrupt the projection with no other symptom.
-int dn_eig_values(dn_eig *e, double *a, double *evals);
+int dn_eig_values(dn_eig *e, const double *a, double *evals);
 int dn_eig_vectors(dn_eig *e, int first, int count, double *evecs);
 
 // How many times dn_eig_vectors() had to abandon inverse iteration and fall back

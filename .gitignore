@@ -9,13 +9,16 @@ src/dn_testgen
 src/.build_flags
 
 # Benchmark output
+/vida/
 benchmark/dwidenoise/
 benchmark/svht_denoise/
+benchmark/dipy/
 /edden/mrtrix/
 /edden/svht_denoise/
 
 # Audit scratch
 audit_*.md
+plan_*.md
 
 # Python bytecode (edden/mrtrix.py)
 __pycache__/
@@ -26,3 +29,8 @@ __pycache__/
 
 # macOS release artifacts
 dist/
+
+# zlib-ng is built out of tree so the submodule checkout stays pristine;
+# this is that build directory.
+src/.zlibng/
+src/.zlibng-rev
