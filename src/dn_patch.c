@@ -29,13 +29,9 @@
 #include "dn_coef.h"
 #include "dn_patch.h"
 
-// Gram columns computed per pass over a row.  Swept 2, 4 and 8 in the full
-// workload on 100x100x58x138 -- 1127, 795 and 821 seconds of CPU respectively,
-// against 1221 unblocked.  Do not infer this from clang's vectoriser: at 4 and 8
-// the cost model declines to vectorise the inner loop at all and only 2 keeps
-// the vectorised form, which would pick the width that recovers 8% over the one
-// that recovers 35%.
-#define DN_GRAM_BLOCK 4
+#ifdef DN_USE_ACCELERATE
+#include <Accelerate/Accelerate.h>
+#endif
 
 // Origin of the patch centred on `coord` along an axis of length `dim`, clamped
 // so the patch stays inside the image: near an edge the patch is SHIFTED INWARDS
@@ -126,7 +122,7 @@ dn_work *dn_work_create(const dn_geom *g) {
 	dn_work *w = (dn_work *)dn_calloc(1, sizeof(dn_work));
 	if (!w) return NULL;
 	const int m = g->m, n = g->nvol;
-	w->pt = (float *)dn_malloc((size_t)n * m, sizeof(float));
+	w->pt = (dn_pt_t *)dn_malloc((size_t)n * m, sizeof(dn_pt_t));
 	w->gram = (double *)dn_malloc((size_t)n * n, sizeof(double));
 	w->evecs = (double *)dn_malloc((size_t)n * n, sizeof(double));
 	w->evals = (double *)dn_malloc((size_t)n, sizeof(double));
@@ -236,11 +232,11 @@ static int patch_gather_nonzero(const dn_geom *g, dn_work *w, const float *img,
 	int nonzero = 0;
 	for (int j = 0; j < n; j++) {
 		const float *vol = img + (size_t)j * nvox3d + base;
-		float *dst = w->pt + (size_t)j * m;
+		dn_pt_t *dst = w->pt + (size_t)j * m;
 		for (int i = 0; i < m; i++) {
-			const float v = vol[w->offset[i]];
+			const dn_pt_t v = vol[w->offset[i]];
 			dst[i] = v;
-			nonzero |= (v != 0.0f);
+			nonzero |= (v != 0.0);
 		}
 	}
 	return nonzero;
@@ -266,22 +262,47 @@ int dn_denoise_voxel(const dn_geom *g, dn_work *w, const float *img,
 	}
 
 	// 2. Gram = Y' Y, upper triangle then mirrored.
+#ifdef DN_USE_ACCELERATE
+	// One dsyrk.  Measured 11x the blocked loop below at 138x343 -- Accelerate
+	// puts this on the AMX coprocessor, which no amount of NEON in a hand-written
+	// loop reaches.  It is why `pt` is double on this path: there is no
+	// mixed-precision syrk to feed float operands into a double accumulator, so
+	// the wider gather is the price of admission, and it is worth paying.
+	//
+	// Row-major with lda = m maps directly onto pt's layout, so no repacking.
+	cblas_dsyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, m, 1.0, w->pt, m,
+	            0.0, w->gram, n);
+	// dsyrk fills one triangle; the eigensolver's full path reads both.
+	for (int i = 0; i < n; i++)
+		for (int j = i + 1; j < n; j++)
+			w->gram[(size_t)j * n + i] = w->gram[(size_t)i * n + j];
+#else
+	// Gram columns computed per pass over a row.  Swept 2, 4 and 8 in the full
+	// workload on 100x100x58x138 -- 1127, 795 and 821 seconds of CPU
+	// respectively, against 1221 unblocked.  Do not infer this from clang's
+	// vectoriser: at 4 and 8 the cost model declines to vectorise the inner loop
+	// at all and only 2 keeps the vectorised form, which would pick the width
+	// that recovers 8% over the one that recovers 35%.
+	#define DN_GRAM_BLOCK 4
 	// Four independent accumulators: a single running sum is a serial dependency
 	// chain through the FMA latency, which stops the compiler vectorising and
 	// leaves most of the unit idle.  The split is a FIXED partition, so the
 	// summation order is still identical on every run and at every thread count.
 	//
 	// Blocked over j on top of that: DN_GRAM_BLOCK columns share one pass over
-	// row i, so row i is read once per block instead of once per j.  That is
-	// where the time went -- blocking alone is 35% of the whole run at 138x343,
-	// while the float rows it feeds on are worth 11% with it and nothing without.
+	// row i, so row i is read once per block instead of once per j.  On THIS
+	// path that is where the time went -- blocking alone is 35% of the whole run
+	// at 138x343, and the float rows it feeds on are worth 11% with it and
+	// nothing without.  (dsyrk above beats this loop 11x where it is available;
+	// this is the only implementation everywhere else.)
 	//
 	// Neither is a numerics change.  The rows widen back to double here, and
 	// since they were copied from a float32 image the widened value IS the value
 	// a double array would have held; blocking only interleaves independent dot
 	// products, leaving the four accumulators and the fixed partition inside each
-	// one untouched.  So the output is bit-identical -- asserted against a
-	// preserved binary on 80 M voxels, not assumed.
+	// one untouched.  So the output is bit-identical WITHIN this path -- asserted
+	// against a preserved binary on 80 M voxels, not assumed.  It is not
+	// bit-identical to the dsyrk path above; see the Makefile.
 	for (int i = 0; i < n; i++) {
 		const float *a = w->pt + (size_t)i * m;
 		int j = i;
@@ -325,6 +346,7 @@ int dn_denoise_voxel(const dn_geom *g, dn_work *w, const float *img,
 			w->gram[(size_t)j * n + i] = acc;
 		}
 	}
+#endif
 
 	// 3. Eigenvalues of the Gram are the squared singular values.
 	//

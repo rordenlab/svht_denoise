@@ -160,12 +160,22 @@ endif
 # that this builds for, resolved at load like libSystem, and it adds nothing to
 # the executable.  That is why it is admitted where a BLAS is not.
 #
-# It changes the numbers -- a blocked reduction is a different algorithm, not a
-# faster spelling of the same one -- by ~3e-10 relative L2 with the rank map
-# identical, and byte-identical below LAPACK's own blocking crossover.  A build
-# with it and one without are NOT bit-identical to each other.  Byte-identity
-# across thread counts holds within either build, which is the promise made.
+# It changes the numbers, and the divergence needs a big sample to see: measured
+# at ~3e-10 relative L2 with the rank map identical on a 100x100x58 x 138 uint16
+# series (580k voxels), while the repository's own fixtures and a synthetic
+# 16^3 x 138 all come out byte-identical between the two builds.  So "not
+# bit-identical" is true but not reproducible on anything shipped here -- do not
+# conclude from a green fixture that the two agree.  The Gram differs at every n
+# rather than only above LAPACK's blocking crossover, though on integer-valued
+# input (any uint16/int16 scan) the products and their sums are exact in double
+# and dsyrk agrees bit for bit anyway.  Byte-identity ACROSS THREAD COUNTS holds
+# within either build, which is the promise actually made.
 ACCELERATE ?= $(if $(filter Darwin,$(UNAME_S)),1,0)
+# Same hard error ZLIBNG gets, for the same reason: `ACCELERATE=yes` would
+# otherwise select the portable reduction silently and ship the slower kernel.
+ifeq ($(filter 0 1,$(ACCELERATE)),)
+  $(error ACCELERATE must be 0 or 1 (got '$(ACCELERATE)'))
+endif
 ifeq ($(ACCELERATE),1)
   override REQ_CFLAGS += -DDN_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
   ACCEL_LIB = -framework Accelerate
@@ -206,9 +216,29 @@ FLAGSTAMP := .build_flags
 CURFLAGS  := $(CC) $(ALL_CFLAGS) $(LDLIBS)
 
 # The stamp is a real file that every object depends on, and it is REWRITTEN
-# (so its mtime moves) only when the flags actually change.  Deleting objects
-# from a recipe does not work: make plans the whole graph from the file state it
-# saw at startup, so a target it already judged up to date stays that way.
+# (so its mtime moves) only when the flags actually change.
+#
+# The stale objects are removed at PARSE TIME, immediately below, and that is
+# load-bearing rather than tidy.  A recipe cannot do it: make plans the whole
+# graph from the file state it saw at startup, so a target it has already judged
+# up to date stays that way even after the recipe deletes it.  Depending on the
+# stamp's MTIME instead is defeated by `-j`, because GNU Make 3.81 -- which is
+# what /usr/bin/make is on macOS -- plans each object against the stamp as it
+# stood BEFORE the stamp's own recipe rewrote it.  Both failures are silent and
+# both were measured:
+#
+#   make -j8 && make -j8 ACCELERATE=0     link never runs; the binary still has
+#                                         Accelerate in it while the build says
+#                                         "the built-in reduction"
+#   make -j8 && make -j8 ubsan-test       78 passed, with the eigensolver and
+#                                         patch kernel UNINSTRUMENTED
+#
+# The second is the sanitizer gate this file already believes it closed, still
+# open under -j.  A MISSING object cannot be mis-dated, which is why deleting
+# beats any amount of dependency ordering here.
+ifneq ($(strip $(CURFLAGS)),$(strip $(shell cat $(FLAGSTAMP) 2>/dev/null)))
+  $(shell rm -f *.o svht_denoise dn_testgen)
+endif
 .PHONY: force
 force: ;
 $(FLAGSTAMP): force

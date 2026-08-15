@@ -8,7 +8,7 @@ default PATH, so it is ready to use immediately:
 
 The binary is for Apple Silicon (arm64). This build requires macOS 14 or newer;
 the minimum is set at build time by MACOSX_DEPLOYMENT_TARGET. It is entirely
-self-contained: it links only against libSystem, which ships with macOS, and
+self-contained: it links only against libSystem and Apple's Accelerate framework, which ships with macOS, and
 statically embeds zlib-ng for reading and writing .nii.gz. There is no folder
 to keep together and nothing else to download. You may copy it to any other
 Apple Silicon Mac and it will run. On an Intel Mac, build from source instead:

@@ -7,6 +7,13 @@
 
 #include "dn_eig.h"
 
+// Element type of the patch buffer; see the note on `pt` below.
+#ifdef DN_USE_ACCELERATE
+typedef double dn_pt_t;
+#else
+typedef float dn_pt_t;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,12 +42,16 @@ int dn_auto_extent(int nvol);
 
 // Per-worker scratch.  One arena per thread; nothing here is shared.
 typedef struct {
-	// float, NOT double, and that is exact rather than a compromise: every value
-	// in here is copied straight out of a float32 image, so widening it at the
-	// point of use gives bit-for-bit the same operands the double array held.  It
-	// halves the largest per-worker array -- 370 kB to 185 kB at 138x343 -- which
-	// is what the Gram loop's inner passes actually stream.
-	float *pt;       // n*m, patch transposed: pt[j*m + i] = voxel i, volume j
+	// float on the portable path, and that is exact rather than a compromise:
+	// every value in here is copied straight out of a float32 image, so widening
+	// it at the point of use gives bit-for-bit the same operands a double array
+	// would have held, at half the footprint -- 185 kB against 370 kB at 138x343,
+	// which is what the blocked Gram loop's inner passes stream.
+	//
+	// DOUBLE under Accelerate, because BLAS has no mixed-precision syrk: dsyrk
+	// wants the operand in the precision it accumulates in.  Paying the wider
+	// gather to reach it is measured as worth it; see the Gram kernel.
+	dn_pt_t *pt;     // n*m, patch transposed: pt[j*m + i] = voxel i, volume j
 	double *gram;    // n*n
 	double *evecs;   // n*n
 	double *evals;   // n

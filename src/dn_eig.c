@@ -27,11 +27,12 @@
 #ifdef DN_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
 
-// Evaluation build (`make ACCELERATE=1`): LAPACK's blocked dsytrd replaces the
-// reduction, and dormtr the back-transform, on the SPLIT path only.  The full
-// path (n < DN_SPLIT_MIN) is untouched, because the reduction is not where its
-// time goes.  `hh` carries LAPACK's tau instead of our h values -- same length,
-// same lifetime, so it is reused rather than duplicated.
+// The macOS DEFAULT (`ACCELERATE=0` opts out; every other platform uses the code
+// below).  LAPACK's blocked dsytrd replaces the reduction and dormtr the
+// back-transform, on the SPLIT path only -- the full path's reduction is not
+// where its time goes, though its Gram does go through dsyrk like everything
+// else.  `hh` carries LAPACK's tau instead of our h values: tau is n-1 where hh
+// is n, so it fits, and the lifetime is the same, hence reused not duplicated.
 // The NEW LAPACK interface, which binds to dsytrd$NEWLAPACK.  Those symbols
 // first exist in macOS 13.3, so this spelling and the deployment target are
 // tied together: built against anything older, the binary passes every check in
@@ -68,7 +69,8 @@ struct dn_eig {
 // tred2 + tql2
 // ---------------------------------------------------------------------------
 
-// The Householder reduction, shared by both callers below.  They differ only in
+// The Householder reduction, shared by both callers below on the portable path
+// (under Accelerate only tred2 reaches it, via the full solver).  They differ only in
 // the TAIL, and only because d is left holding the per-step h values here:
 // tred_reduce puts the diagonal back and keeps the reflectors, while tred2
 // consumes those same h values to expand the transform.
@@ -553,6 +555,11 @@ dn_eig *dn_eig_create(int n) {
 		dsytrd_("U", &N, e->refl, &LDA, e->td, e->te, e->hh, &wq1, &QUERY, &INFO);
 		dormtr_("L", "U", "N", &N, &NC, e->refl, &LDA, e->hh, e->w, &LDC,
 		        &wq2, &QUERY, &INFO);
+		// The floor is a deliberate fallback, not padding: if either query failed
+		// the wq stays 0 and this lands on 2n, which both routines accept and
+		// work correctly with (verified for n = 48..282 and every nc in 1..n).
+		// The result is then differently blocked and so numerically different by
+		// ~1e-9, which is why the floor is documented rather than silent.
 		int want = (int)wq1 > (int)wq2 ? (int)wq1 : (int)wq2;
 		if (want < 2 * n) want = 2 * n;
 		e->lwork = want;

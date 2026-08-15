@@ -119,7 +119,18 @@ esac
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/svht_bench.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
+# Say which build each binary is, for the same reason `make` says which zlib and
+# which reduction went in: two binaries can differ by a compile-time switch with
+# nothing in the timings to show it, and this project has already lost one
+# comparison that way.
 echo "bench: $IN  [$ARGS]  load $load  ${RUNS} rounds"
+for b in "$@"; do
+	sv_kern=portable
+	otool -L "$b" 2>/dev/null | grep -q 'Accelerate\.framework' && sv_kern=Accelerate
+	otool -L "$b" 2>/dev/null | awk '/^\t/ { print $1 }' | grep -q 'libz\.' &&
+		sv_zl="system zlib" || sv_zl="static zlib-ng"
+	printf '  %-28s %s, %s\n' "$(basename "$b")" "$sv_kern" "$sv_zl"
+done
 
 # One timed run; appends "wall cpu rss" to that binary's sample file.
 run_one() {

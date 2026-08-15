@@ -26,6 +26,7 @@
 #endif
 
 #include "dn.h"
+#include "dn_patch.h"
 #include "dn_run.h"
 
 // Voxels handed out per chunk.  The old fixed 2048 was ~0.9 s of work at
@@ -42,7 +43,11 @@
 // n*m blocks are what actually grow.
 static size_t worker_bytes(const dn_geom *g) {
 	const size_t n = (size_t)g->nvol, m = (size_t)g->m;
-	return n * m * sizeof(float) + 4 * n * n * sizeof(double);
+	// sizeof(dn_pt_t), not sizeof(float): the patch buffer is double under
+	// Accelerate and float otherwise, so a hardcoded float under-prices every
+	// worker on the macOS default by n*m*4 bytes and lets the cap admit more of
+	// them than the budget allows.
+	return n * m * sizeof(dn_pt_t) + 4 * n * n * sizeof(double);
 }
 
 typedef struct {

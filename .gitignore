@@ -10,6 +10,7 @@ src/.build_flags
 
 # Benchmark output
 /vida/
+/iso15/
 benchmark/dwidenoise/
 benchmark/svht_denoise/
 benchmark/dipy/
