@@ -24,6 +24,15 @@
 #include "dn.h"
 #include "dn_eig.h"
 
+#ifdef DN_USE_ACCELERATE
+#include <Accelerate/Accelerate.h>
+// Evaluation build (`make ACCELERATE=1`): LAPACK's blocked dsytrd replaces the
+// reduction, and dormtr the back-transform, on the SPLIT path only.  The full
+// path (n < DN_SPLIT_MIN) is untouched, because the reduction is not where its
+// time goes.  `hh` carries LAPACK's tau instead of our h values -- same length,
+// same lifetime, so it is reused rather than duplicated.
+#endif
+
 struct dn_eig {
 	int n;
 	double *d;   // n : diagonal / eigenvalues
@@ -38,6 +47,10 @@ struct dn_eig {
 	double *z;       // n   : one eigenvector under construction
 	double *gt;      // 6*n : tridiagonal LU workspace (4n doubles + an int block)
 	double tnorm;    // ||T||, for the inverse-iteration tolerances
+#ifdef DN_USE_ACCELERATE
+	double *lwk;     // LAPACK workspace, sized once at create
+	int lwork;
+#endif
 	unsigned long fallbacks;  // times inverse iteration lost and the full solve ran
 	int staged;      // 1 if the split path has valid state
 	int full_valid;  // 1 if `refl` already holds a complete eigenvector set
@@ -308,6 +321,7 @@ static int tql2(double *V, double *d, double *e, int n) {
 // the tridiagonal -- O(n) per solve -- back-transformed through the reflectors.
 // This is the shape of LAPACK's dsytrd / dsterf / dstein / dormtr, written small.
 
+#ifndef DN_USE_ACCELERATE
 // Reduction half of tred2.  On exit V holds the Householder vector for step p in
 // V[0..p-1][p], hh[p] its h, d the diagonal and e the sub-diagonal.
 static void tred_reduce(double *V, double *d, double *e, double *hh, int n) {
@@ -316,7 +330,9 @@ static void tred_reduce(double *V, double *d, double *e, double *hh, int n) {
 	for (int j = 0; j < n; j++) d[j] = V[(size_t)j * n + j];
 	e[0] = 0.0;
 }
+#endif
 
+#ifndef DN_USE_ACCELERATE
 // z <- Q z, where Q is the product of the stored reflectors.  The accumulation
 // loop in tred2 applies reflector p to column j for every p > j in increasing p,
 // so Q = H_{n-1} ... H_1 and the same order applies here.
@@ -330,6 +346,31 @@ static void tred_apply_q(const double *V, const double *hh, double *z, int n) {
 		for (int k = 0; k < p; k++) z[k] -= g * V[(size_t)k * n + p];
 	}
 }
+#else
+// dsytrd wants a symmetric matrix in column-major order; ours is row-major with
+// BOTH triangles filled, and a full symmetric matrix is its own transpose, so it
+// is passed straight through with no copy and no repacking.
+//
+// The sub-diagonal goes into e + 1, not e.  LAPACK indexes it e[i] = T(i, i+1),
+// while everything here indexes it e[i] = T(i-1, i) with e[0] unused; offsetting
+// the pointer by one converts between them for free.
+static void tred_reduce_accel(dn_eig *eg, double *V, double *d, double *e,
+                              double *tau, int n) {
+	__LAPACK_int N = n, LDA = n, LW = eg->lwork, INFO = 0;
+	dsytrd_("U", &N, V, &LDA, d, e + 1, tau, eg->lwk, &LW, &INFO);
+	e[0] = 0.0;
+}
+
+// Q applied to `nc` vectors at once.  They are stored one per contiguous run of
+// n doubles, which is exactly a column-major n x nc block with ldc = n, so the
+// per-vector loop this replaces collapses into one call.
+static void tred_apply_q_accel(dn_eig *eg, const double *V, const double *tau,
+                               double *C, int nc, int n) {
+	__LAPACK_int N = n, NC = nc, LDA = n, LDC = n, LW = eg->lwork, INFO = 0;
+	dormtr_("L", "U", "N", &N, &NC, (double *)V, &LDA, (double *)tau,
+	        C, &LDC, eg->lwk, &LW, &INFO);
+}
+#endif
 
 // Solve (T - lam*I) x = b for a symmetric tridiagonal T, in place on x.
 // Gaussian elimination with partial pivoting, LAPACK-style: a pivot that
@@ -493,6 +534,24 @@ dn_eig *dn_eig_create(int n) {
 	e->gt = (double *)dn_malloc((size_t)n * 6, sizeof(double));
 	if (!e->d || !e->e || !e->w || !e->refl || !e->hh || !e->td || !e->te ||
 	    !e->ev || !e->z || !e->gt) { dn_eig_free(e); return NULL; }
+#ifdef DN_USE_ACCELERATE
+	// Size the LAPACK workspace ONCE per worker, not per voxel: both routines
+	// report their optimum when called with lwork = -1, and this arena is reused
+	// for millions of solves.  Take the larger of the two, and never less than
+	// the documented minimum each guarantees to work with.
+	{
+		__LAPACK_int N = n, LDA = n, NC = n, LDC = n, QUERY = -1, INFO = 0;
+		double wq1 = 0.0, wq2 = 0.0;
+		dsytrd_("U", &N, e->refl, &LDA, e->td, e->te, e->hh, &wq1, &QUERY, &INFO);
+		dormtr_("L", "U", "N", &N, &NC, e->refl, &LDA, e->hh, e->w, &LDC,
+		        &wq2, &QUERY, &INFO);
+		int want = (int)wq1 > (int)wq2 ? (int)wq1 : (int)wq2;
+		if (want < 2 * n) want = 2 * n;
+		e->lwork = want;
+		e->lwk = (double *)dn_malloc((size_t)want, sizeof(double));
+		if (!e->lwk) { dn_eig_free(e); return NULL; }
+	}
+#endif
 	return e;
 }
 
@@ -508,6 +567,9 @@ void dn_eig_free(dn_eig *e) {
 	free(e->ev);
 	free(e->z);
 	free(e->gt);
+#ifdef DN_USE_ACCELERATE
+	free(e->lwk);
+#endif
 	free(e);
 }
 
@@ -567,7 +629,11 @@ int dn_eig_values(dn_eig *e, const double *a, double *evals) {
 	}
 
 	memcpy(e->refl, a, (size_t)n * n * sizeof(double));
+#ifdef DN_USE_ACCELERATE
+	tred_reduce_accel(e, e->refl, e->td, e->te, e->hh, n);
+#else
 	tred_reduce(e->refl, e->td, e->te, e->hh, n);
+#endif
 
 	// tql2 destroys its inputs, so it works on the copies.
 	memcpy(e->d, e->td, (size_t)n * sizeof(double));
@@ -609,7 +675,11 @@ static int eig_vectors_full_fallback(dn_eig *e, int first, int count, double *ev
 	for (int c = 0; c < count; c++) {
 		const int k = first + c;
 		for (int i = 0; i < n; i++) e->z[i] = Z[(size_t)i * n + k];
+#ifdef DN_USE_ACCELERATE
+		tred_apply_q_accel(e, e->refl, e->hh, e->z, 1, n);
+#else
 		tred_apply_q(e->refl, e->hh, e->z, n);
+#endif
 		for (int i = 0; i < n; i++) evecs[(size_t)i * n + k] = e->z[i];
 	}
 	e->fallbacks++;
@@ -639,11 +709,15 @@ int dn_eig_vectors(dn_eig *e, int first, int count, double *evecs) {
 			return eig_vectors_full_fallback(e, first, count, evecs);
 		memcpy(e->w + (size_t)c * n, e->z, (size_t)n * sizeof(double));
 	}
-	for (int c = 0; c < count; c++) {
+#ifdef DN_USE_ACCELERATE
+	tred_apply_q_accel(e, e->refl, e->hh, e->w, count, n);
+#else
+	for (int c = 0; c < count; c++)
 		tred_apply_q(e->refl, e->hh, e->w + (size_t)c * n, n);
+#endif
+	for (int c = 0; c < count; c++)
 		for (int i = 0; i < n; i++)
 			evecs[(size_t)i * n + first + c] = e->w[(size_t)c * n + i];
-	}
 	return 0;
 }
 

@@ -146,8 +146,29 @@ else
   ZLIB_WHICH  = zlib-ng (static)
 endif
 
+# ------------------------------------------------------------ Apple Accelerate
+#
+# `make ACCELERATE=1` swaps the split path's Householder reduction and its
+# back-transform for LAPACK's dsytrd and dormtr out of Accelerate.  OFF by
+# default and deliberately so: this is an evaluation switch, not a supported
+# configuration.  It adds a framework dependency, which the dependency rule in
+# AGENTS.md does not admit, and it changes the numbers -- Accelerate's blocked
+# reduction is a different algorithm, not a faster spelling of ours, so results
+# move by roughly solver-noise and are NOT bit-identical to a default build.
+# Byte-identity across thread counts still holds within either build.
+#
+# It exists to answer one question with a measurement instead of an argument:
+# the unblocked reduction is the largest single block left (~39% of CPU), and
+# writing a compact-WY blocked version by hand is the riskiest change available.
+# If a library that has been tuned for this hardware for twenty years does not
+# beat the loop in dn_eig.c, hand-writing one is not going to.
+ifeq ($(ACCELERATE),1)
+  override REQ_CFLAGS += -DDN_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+  ACCEL_LIB = -framework Accelerate
+endif
+
 ALL_CFLAGS = $(REQ_CFLAGS) $(CFLAGS) $(DEFS) $(ZLIB_CFLAGS) $(CPPFLAGS)
-LDLIBS   = -lm $(ZLIB_LIB) -lpthread
+LDLIBS   = -lm $(ZLIB_LIB) -lpthread $(ACCEL_LIB)
 
 # .nii.gz support is compiled into nifti_io only when HAVE_ZLIB is defined; without
 # it every compressed read fails at run time with a "recompile for compressed data"
