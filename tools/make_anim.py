@@ -9,8 +9,13 @@ Paths default to the repository root, so the script runs from any directory.
 
 Needs nibabel, numpy and Pillow, plus a niimath binary on the PATH.
 
+Volumes are chosen by DIFFUSION WEIGHTING, not by index: every volume whose
+b-value reaches --minb is shown.  The b-values come from a .bval beside the
+input, found automatically.  Without one, the --first/--last range is used as-is.
+
 Example:
-    python3 tools/make_anim.py                       # y 0.3, volumes 1..30
+    python3 tools/make_anim.py                       # y 0.3, b >= 50
+    python3 tools/make_anim.py --minb 1500           # the shells that matter
     python3 tools/make_anim.py -o z -s 0.5 -f 1 -l 30
 """
 
@@ -27,11 +32,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent.parent
 
-ROWS = [
-    ("input", "input"),
-    ("dwidenoise", "MRtrix3 dwidenoise"),
-    ("svht_denoise", "svht_denoise"),
-]
+DEFAULT_ROWS = ["input=input", "dwidenoise=MRtrix3 dwidenoise", "svht_denoise=svht_denoise"]
 
 
 def parse_args():
@@ -41,10 +42,18 @@ def parse_args():
                    help="folder holding input/, dwidenoise/, svht_denoise/ (default: <repo>/benchmark)")
     p.add_argument("-n", "--name", default="dwi.nii.gz",
                    help="NIfTI filename inside each method folder (default: dwi.nii.gz)")
-    p.add_argument("-f", "--first", type=int, default=1,
-                   help="first volume to display, indexed from 0 (default: 1)")
-    p.add_argument("-l", "--last", type=int, default=30,
-                   help="last volume to display, inclusive (default: 30)")
+    p.add_argument("-f", "--first", type=int, default=0,
+                   help="first volume to consider, indexed from 0 (default: 0)")
+    p.add_argument("-l", "--last", type=int, default=None,
+                   help="last volume to consider, inclusive (default: the final volume)")
+    p.add_argument("--minb", type=float, default=50.0,
+                   help="show only volumes whose b-value reaches this (default: 50, "
+                        "which drops the b=0 images)")
+    p.add_argument("--bval", type=Path, default=None,
+                   help="FSL .bval file (default: the only *.bval beside the input)")
+    p.add_argument("-R", "--rows", action="append", metavar="FOLDER[/FILE]=LABEL",
+                   help="one row per flag, top to bottom; give FOLDER/FILE when the rows "
+                        "do not share a filename (default: %s)" % ", ".join(DEFAULT_ROWS))
     p.add_argument("-o", "--orient", choices=["x", "y", "z"], default="y",
                    help="slice orientation (default: y)")
     p.add_argument("-s", "--slice", type=float, default=0.3,
@@ -65,10 +74,50 @@ def parse_args():
     return p.parse_args()
 
 
-def window(path, first, last, pct):
+def window(path, vols, pct):
     """Robust intensity window taken from the displayed volumes of the input."""
-    data = np.asanyarray(nib.load(str(path)).dataobj)[..., first:last + 1]
+    data = np.asanyarray(nib.load(str(path)).dataobj)[..., vols]
     return 0.0, float(np.percentile(data, pct))
+
+
+def find_bval(folder, given):
+    """The .bval to read b-values from, or None."""
+    if given is not None:
+        return given if given.is_file() else sys.exit(f"missing --bval file: {given}")
+    hits = sorted(folder.glob("*.bval"))
+    if len(hits) == 1:
+        return hits[0]
+    # Zero is the ordinary case for data that never had one; more than one is
+    # ambiguous and guessing would silently animate the wrong shells.
+    if len(hits) > 1:
+        print(f"several .bval files in {folder}; pass --bval to choose")
+    return None
+
+
+def select(volumes_path, folder, args):
+    """Which volume indices to animate, and why."""
+    nvol = nib.load(str(volumes_path)).shape[3]
+    last = nvol - 1 if args.last is None else args.last
+    if last >= nvol:
+        sys.exit(f"--last {last} exceeds the final volume index {nvol - 1}")
+    if last < args.first:
+        sys.exit(f"--last ({last}) precedes --first ({args.first})")
+    span = list(range(args.first, last + 1))
+
+    bval = find_bval(folder, args.bval)
+    if bval is None:
+        print(f"no .bval found, showing volumes {args.first}..{last} unfiltered")
+        return span
+    b = np.loadtxt(bval, ndmin=1)
+    if b.size != nvol:
+        sys.exit(f"{bval} has {b.size} b-values for {nvol} volumes")
+    keep = [v for v in span if b[v] >= args.minb]
+    if not keep:
+        sys.exit(f"no volume in {args.first}..{last} reaches b >= {args.minb:g} "
+                 f"(the data runs {b.min():g}..{b.max():g})")
+    print(f"b >= {args.minb:g} keeps {len(keep)} of {len(span)} volumes "
+          f"(b {b[keep].min():g}..{b[keep].max():g})")
+    return keep
 
 
 def render(niimath, nii, vol, args, lo, hi, png):
@@ -102,28 +151,32 @@ def main():
     niimath = shutil.which(args.niimath)
     if niimath is None:
         sys.exit(f"niimath not found: {args.niimath}")
-    if args.last < args.first:
-        sys.exit(f"--last ({args.last}) precedes --first ({args.first})")
 
-    volumes = [args.benchmark / folder / args.name for folder, _ in ROWS]
+    # A row is FOLDER=LABEL, and FOLDER may carry a filename when the rows do not
+    # share one -- comparing a rotated input against two denoised series is the
+    # ordinary case for complex data, and those three are not called the same.
+    rows, volumes = [], []
+    for spec in (args.rows or DEFAULT_ROWS):
+        where, _, text = spec.partition("=")
+        rows.append((where, text or where))
+        volumes.append(args.benchmark / where if "/" in where
+                       else args.benchmark / where / args.name)
     for nii in volumes:
         if not nii.is_file():
             sys.exit(f"missing volume: {nii}")
 
-    nvol = nib.load(str(volumes[0])).shape[3]
-    if args.last >= nvol:
-        sys.exit(f"--last {args.last} exceeds the final volume index {nvol - 1}")
+    vols = select(volumes[0], volumes[0].parent, args)
 
-    lo, hi = args.range if args.range else window(volumes[0], args.first, args.last, args.pct)
-    print(f"intensity window {lo:g}..{hi:g}, volumes {args.first}..{args.last}")
+    lo, hi = args.range if args.range else window(volumes[0], vols, args.pct)
+    print(f"intensity window {lo:g}..{hi:g}")
 
     frames = []
     with tempfile.TemporaryDirectory() as tmp:
         png = Path(tmp) / "frame.png"
-        for vol in range(args.first, args.last + 1):
+        for n, vol in enumerate(vols, 1):
             panels = [render(niimath, nii, vol, args, lo, hi, png) for nii in volumes]
             if args.labels:
-                panels = [label(p, text) for p, (_, text) in zip(panels, ROWS)]
+                panels = [label(p, text) for p, (_, text) in zip(panels, rows)]
             width = max(p.width for p in panels)
             tile = Image.new("L", (width, sum(p.height for p in panels)))
             y = 0
@@ -131,7 +184,7 @@ def main():
                 tile.paste(p, ((width - p.width) // 2, y))
                 y += p.height
             frames.append(tile)
-            print(f"\rvolume {vol}", end="", flush=True)
+            print(f"\rvolume {vol} ({n}/{len(vols)})", end="", flush=True)
     print()
 
     frames[0].save(args.out, save_all=True, append_images=frames[1:],
