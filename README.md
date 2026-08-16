@@ -74,11 +74,18 @@ One caveat on the degibbs rows: this binary links zlib-ng while MRtrix3 links th
 **Method**
 
 - Gavish M, Donoho DL. The optimal hard threshold for singular values is 4/√3. *IEEE Trans Inf Theory* 2014;60(8):5040-5053. [DOI](https://ieeexplore.ieee.org/document/6846297) — the threshold implemented here; the [preprint](https://arxiv.org/abs/1305.5870) is bundled with this repository.
-- Veraart J, Novikov DS, Christiaens D, Ades-Aron B, Sijbers J, Fieremans E. Denoising of diffusion MRI using random matrix theory. *NeuroImage* 2016;142:394-406. [PMID 27523449](https://pubmed.ncbi.nlm.nih.gov/27523449/) — MPPCA, the reference approach.
+- Manjón JV, Coupé P, Concha L, Buades A, Collins DL, Robles M.  Diffusion Weighted Image Denoising Using Overcomplete Local PCA [PMID 24019889](https://pubmed.ncbi.nlm.nih.gov/24019889/) PLoS One. 2013;8:e73021. doi: 10.1371/journal.pone.0073021.
+- Veraart J, Novikov DS, Christiaens D, Ades-Aron B, Sijbers J, Fieremans E. Denoising of diffusion MRI using random matrix theory. *NeuroImage* 2016;142:394-406. [PMID 27523449](https://pubmed.ncbi.nlm.nih.gov/27523449/) — MPPCA, the dwidenoise approach.
 - Kellner E, Dhital B, Kiselev VG, Reisert M. Gibbs-ringing artifact removal based on local subvoxel-shifts. *Magn Reson Med* 2016;76:1574-1581. — the `-degibbs` method.
 - Moeller S, Pisharady PK, Ramanna S, et al. NOise reduction with DIstribution Corrected (NORDIC) PCA. *NeuroImage* 2021;226:117539. — origin of the phase rotation.
 - Manzano Patron JP, Moeller S, Andersson JLR, et al. Denoising diffusion MRI: considerations and implications for analysis. *Imaging Neuroscience* 2024. [PMID 40800437](https://pubmed.ncbi.nlm.nih.gov/40800437/) — the "MPPCA\*" pipeline `-phase` reproduces. Datasets, scripts and methods to quantify performance.
- 
+
+**Related Patents**
+
+Tools such as [dwidenoise](https://mrtrix.readthedocs.io/en/dev/reference/commands/dwidenoise.html) and [dwidenoise2](https://github.com/Lestropie/dwidenoise2) rely on algorithms covered by active patents (e.g., [US10698065B2](https://patents.google.com/patent/US10698065B2/en)) and are explicitly restricted to non-commercial research use.
+
+In contrast, `svht_denoise` builds upon earlier, unencumbered frameworks by Manjón et al. (2013) and Gavish & Donoho (2014). The algorithm calculates noise thresholds directly without relying on MPPCA noise estimation, and is implemented as an independent clean-room build. Consequently, the authors believe `svht_denoise` is not subject to these patent restrictions. However, commercial users should independently evaluate their legal compliance, as the authors provide no formal legal warranties.
+
 **Software**
 
 - [MRtrix3](https://www.mrtrix.org/) — [dwidenoise](https://mrtrix.readthedocs.io/en/dev/reference/commands/dwidenoise.html) and [mrdegibbs](https://mrtrix.readthedocs.io/en/dev/reference/commands/mrdegibbs.html), the reference implementations benchmarked here. Note `dwidenoise` is restricted to non-commercial research use.
