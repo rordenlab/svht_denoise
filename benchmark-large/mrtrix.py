@@ -14,8 +14,9 @@ shipped with the EDDEN code), which is NIFTI_NORDIC.m with the denoising removed
      low-pass k-space filter (Tukey^3 window)
   4. keep the real part
 
-Usage:  python3 mrtrix.py                         # ./input -> ./mrtrix
-        python3 mrtrix.py MAG PHASE OUTDIR        # anywhere else
+Usage:  python3 mrtrix.py MAG PHASE OUTDIR [--rotate-only]
+
+All three paths are required.
 """
 
 import subprocess

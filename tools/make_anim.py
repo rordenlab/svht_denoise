@@ -27,10 +27,14 @@ Example:
     # the large series, every b > 1500 volume, rows with different filenames:
     python3 tools/make_anim.py -b benchmark-large --minb 1500 -s 0.45 -d 150 \\
         --bval benchmark-large/dwi/sub-01_ses-1p5mm_dir-AP_dwi.bval \\
-        -R "svht_denoise/real.nii.gz=input (complex, rotated to real)" \\
+        -R "mrtrix/real.nii.gz=input (complex, rotated to real)" \\
         -R "mrtrix/denoised.nii.gz=MRtrix3 MPPCA*" \\
         -R "svht_denoise/denoised.nii.gz=svht_denoise" \\
-        images/anim_EDDEN1p5mm.gif
+        /tmp/anim_EDDEN1p5mm.gif
+
+    NOT images/anim_EDDEN1p5mm.gif: the copy README embeds lives there and is
+    hand-compressed to ~2.4 MB, so writing to it replaces it with a ~7 MB
+    regenerated one.  Compress first, then move it into place.
 """
 
 import argparse
@@ -89,7 +93,9 @@ def parse_args():
                    help="where to inflate .nii.gz inputs (default: the system temp dir). "
                         "Needs room for one uncompressed copy of every row.")
     p.add_argument("out", nargs="?", type=Path, default=ROOT / "images" / "anim_compare.gif",
-                   help="output GIF (default: <repo>/images/anim_compare.gif, the one README.md embeds)")
+                   help="output GIF (default: <repo>/images/anim_compare.gif). Do NOT aim this "
+                        "at images/anim_EDDEN1p5mm.gif, the copy README embeds: it is "
+                        "hand-compressed and would be overwritten.")
     return p.parse_args()
 
 

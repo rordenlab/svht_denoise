@@ -9,10 +9,16 @@
 //   dn_testgen cmp <a.nii> <b.nii> <tol>       exit 0 if max|a-b| <= tol
 //   dn_testgen rl2 <a.nii> <b.nii> <tol>       exit 0 if rms(a-b)/rms(b) <= tol
 //   dn_testgen rms <file.nii> <want> <reltol>  exit 0 if the RMS still matches
+//   dn_testgen neg <file.nii>                  exit 0 if any value is negative
 //
-// Fixtures are 9x9x3 x 8 volumes (the "mask" kind is a single volume, "big48" a
-// 9x9x5 x 48 one), deterministic, and every phase kind bar phase-siemens encodes
-// the SAME underlying phase, so any two of them must denoise to the same answer.
+// Fixtures are 9x9x3 x 8 volumes, deterministic, with five exceptions: "mask" is
+// a single volume, "big48" is 9x9x5 x 48, "mask-wrongdim" is 7x9x3 x 1,
+// "mag-even" is 9x10x3 -- the only shape -pF 0.75 runs on at all -- and
+// "mag-shorty" is 9x6x3, which is even too but whose -pF interleaves are too
+// short at either factor.
+//
+// Every phase kind bar phase-siemens encodes the SAME underlying phase, so any
+// two of them must denoise to the same answer.
 
 #include <float.h>
 #include <limits.h>
@@ -248,11 +254,28 @@ int main(int argc, char **argv) {
 		return (want != 0.0 && fabs(rms - want) / fabs(want) <= reltol) ? 0 : 1;
 	}
 
+	// Exit 0 if the file holds a negative value.  A TRUNCATED output is not a
+	// small numeric drift, so RMS alone is a weak witness for it; this asks the
+	// question directly.  It cannot distinguish truncation from rectification --
+	// neither leaves a negative -- so the mag-signed/mag-clamped byte-identity
+	// pair in test.sh is what pins which of the two we perform.
+	if (argc == 3 && !strcmp(argv[1], "neg")) {
+		int n = 0;
+		float *a = read_nii(argv[2], &n);
+		if (!a) return 2;
+		int nneg = 0;
+		for (int i = 0; i < n; i++) if (a[i] < 0.0f) nneg++;
+		free(a);
+		printf("%d\n", nneg);
+		return nneg > 0 ? 0 : 1;
+	}
+
 	if (argc != 4 || strcmp(argv[1], "mk")) {
 		fprintf(stderr, "usage: dn_testgen mk   <kind> <out.nii>\n"
 		                "       dn_testgen cmp  <a.nii> <b.nii> <tol>\n"
 		                "       dn_testgen rl2  <a.nii> <b.nii> <reltol>\n"
-		                "       dn_testgen rms  <file.nii> <expected> <reltol>\n");
+		                "       dn_testgen rms  <file.nii> <expected> <reltol>\n"
+		                "       dn_testgen neg  <file.nii>\n");
 		return 2;
 	}
 
@@ -352,6 +375,58 @@ int main(int argc, char **argv) {
 		free(b);
 		free(d);
 		return rc;
+	} else if (!strcmp(kind, "mag-even")) {
+		// The only shape -pF 0.75 runs on at all.  6/8 splits y into odd and even
+		// columns, so it refuses an odd count -- and mag-shorty, the other even
+		// fixture, is refused later for a short interleave.  Without this one the
+		// whole 6/8 success path -- half-length axis, strided sub-image -- is
+		// executed by no test.  A sharp-edged disk,
+		// because ringing is what this is for and a smooth field has none.
+		const int eny = 10, en3 = NX * eny * NZ;
+		float *b = (float *)malloc((size_t)en3 * NT * sizeof(float));
+		if (!b) { free(d); return 2; }
+		for (int t2 = 0; t2 < NT; t2++)
+			for (int z = 0; z < NZ; z++)
+				for (int y = 0; y < eny; y++)
+					for (int x = 0; x < NX; x++) {
+						const double dx = x - (NX - 1) / 2.0, dy = y - (eny - 1) / 2.0;
+						const double in = (dx*dx + dy*dy) < 6.0 ? 900.0 : 200.0;
+						const size_t i = (size_t)t2*en3 + (size_t)z*NX*eny + (size_t)y*NX + x;
+						b[i] = (float)(in + 40.0 * rng((uint32_t)i));
+					}
+		rc = write_nii_dim(argv[3], b, NX, eny, NZ, NT, vox);
+		free(b);
+		free(d);
+		return rc;
+	} else if (!strcmp(kind, "mag-shorty")) {
+		// 9x6x3: y clears DG_MIN_DIM, so the plain method runs, but every -pF
+		// interleave falls under it (3 at 6/8, 4 at 7/8).  The only fixture that
+		// reaches dn_degibbs_check's interleave bound; without it that refusal is
+		// executed by nothing.
+		const int sny = 6, sn3 = NX * sny * NZ;
+		float *b = (float *)malloc((size_t)sn3 * NT * sizeof(float));
+		if (!b) { free(d); return 2; }
+		for (int t2 = 0; t2 < NT; t2++)
+			for (int v = 0; v < sn3; v++)
+				b[(size_t)t2*sn3 + v] = (float)(500.0 + 100.0 * rng((uint32_t)(t2*sn3 + v)));
+		rc = write_nii_dim(argv[3], b, NX, sny, NZ, NT, vox);
+		free(b);
+		free(d);
+		return rc;
+	} else if (!strcmp(kind, "mag-signed") || !strcmp(kind, "mag-clamped")) {
+		// Signed input, as a phase-rotated real series is -- degibbs assumes
+		// MAGNITUDE data and truncates it.  "mag-clamped" is the same field with
+		// that truncation already applied, so degibbs of the two must come out
+		// byte-identical; that is what pins the input clamp.  Without a fixture
+		// that actually goes negative, nothing here notices either way.
+		const int clamp = !strcmp(kind, "mag-clamped");
+		for (int t2 = 0; t2 < NT; t2++)
+			for (int v = 0; v < N3; v++) {
+				double s = ((v / NX) % 4 < 2 ? 600.0 : -600.0)
+				            + 80.0 * rng((uint32_t)(t2 * N3 + v));
+				if (clamp && s < 0.0) s = 0.0;
+				d[t2 * N3 + v] = (float)s;
+			}
 	} else if (!strcmp(kind, "phase-halfturns")) {
 		// Half-integer turns.  Under -phaseunits turns this gives exp(i*k*pi),
 		// i.e. a per-voxel factor of +1 or -1 -- a REAL sign modulation, not the

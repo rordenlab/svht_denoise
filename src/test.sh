@@ -28,6 +28,17 @@ check() {
 		bad "$name (exit $got, wanted $want)"; sed 's/^/       /' "$WORK/stderr"; fi
 }
 
+# check_msg <name> <pattern> <cmd...>: exit 0 AND <pattern> on stderr.  Needed
+# because stderr text is otherwise asserted by nothing: the -pF factor in the run
+# summary, and the -phase warning, could both be deleted with this suite green.
+check_msg() {
+	name=$1; pat=$2; shift 2
+	"$@" >"$WORK/stdout" 2>"$WORK/stderr"; got=$?
+	if [ "$got" -eq 0 ] && grep -q "$pat" "$WORK/stderr"
+	then ok "$name"
+	else bad "$name (exit $got, or no '$pat' on stderr)"; sed 's/^/       /' "$WORK/stderr"; fi
+}
+
 # check_collision <name> <cmd...>: exit 1 AND the collision refusal.
 # An exit-code-only assertion is not enough for these: a dangling or cyclic
 # output ALSO fails at the write with exit 1, so the test would pass with the
@@ -404,7 +415,14 @@ then ok "1 thread == $sv_n threads, byte for byte"; else bad "thread count chang
 
 # -degibbs is a build option, so ask the binary rather than assuming.  A
 # DEGIBBS=0 build must run the rest of this suite green and skip only this.
-if "$BIN" -help 2>&1 | grep -q -- '-degibbs'; then
+#
+# Ask the BINARY WHAT IT DOES, not what its help text looks like.  Grepping -help
+# for "-degibbs" once matched prose in the -phase entry on a DEGIBBS=0 build, ran
+# this whole block against a binary that refuses every option in it, and reported
+# 27 failures; grepping for the option entry instead would still break on a
+# rewrap.  A rejected value is answered either "must be y, n or o" or "not
+# compiled into this build", and only the second means the feature is absent.
+if ! "$BIN" -degibbs z 2>&1 | grep -q 'not compiled into this build'; then
 echo "degibbs"
 # "only" does no denoising, so the denoiser's own options have nothing to act on.
 # Ignoring them silently would write fewer files than were asked for, at exit 0.
@@ -418,6 +436,94 @@ check "bad -degibbs value"        1 "$BIN" "$M" "$WORK/o.nii" -quiet -degibbs z
 # the invariant this suite checks while leaving the in-mask corruption.
 check "-mask refused with -degibbs y" 1 "$BIN" "$M" "$WORK/o.nii" -quiet -mask "$WORK/mask.nii" -degibbs y
 check "-degibbs y runs"           0 "$BIN" "$M" "$WORK/dgy.nii" -quiet -degibbs y
+# ...and it must HONOUR -pF.  Every other -pF test uses "only", so dropping the
+# factor on the denoise-then-degibbs path -- the one a real user runs -- left the
+# whole suite green.
+check "-degibbs y honours -pF"    0 "$BIN" "$M" "$WORK/dgy78.nii" -quiet -degibbs y -pF 0.875
+"$GEN" cmp "$WORK/dgy78.nii" "$WORK/dgy.nii" 0 >/dev/null 2>&1; sv_rc=$?
+if [ "$sv_rc" -eq 1 ]; then ok "-degibbs y + -pF differs from -degibbs y"
+elif [ "$sv_rc" -eq 0 ]; then bad "-pF was ignored on the -degibbs y path"
+else bad "comparison failed to run (cmp exit $sv_rc)"; fi
+# The run summary names the factor, and the -phase warning survives -quiet --
+# both are stderr-only, so nothing else here would notice them being deleted.
+check_msg "the summary names the factor" "partial Fourier 7/8" \
+	"$BIN" "$M" "$WORK/rep.nii" -degibbs o -pF 0.875
+check_msg "-phase + -degibbs y warns, even under -quiet" "truncates it to zero" \
+	"$BIN" "$M" "$WORK/warn.nii" -quiet -phase "$WORK/phase-rad.nii" -degibbs y
+# -pF changes how ringing is removed, so it is meaningless without a stage that
+# removes any; and the pipeline differs PER factor rather than varying
+# continuously, so an unimplemented factor must be refused, never rounded to the
+# nearest one we do have.
+check "-pF needs -degibbs"        1 "$BIN" "$M" "$WORK/o.nii" -quiet -pF 0.75
+# 1.0 is a valid factor and still means nothing without -degibbs.  It was the one
+# value accepted there, because the guard tested the factor instead of whether
+# the option was given.
+check "-pF 1.0 needs -degibbs"    1 "$BIN" "$M" "$WORK/o.nii" -quiet -pF 1.0
+check "-pF 7/8 runs"              0 "$BIN" "$M" "$WORK/pf875.nii" -quiet -degibbs o -pF 0.875
+# PINNED, for the same reason the full-Fourier path is: exit 0 says nothing about
+# the arithmetic, and a 7/8 run that silently returned the conventional answer
+# passed every check here before this line existed.
+check "-pF 7/8 RMS is unchanged"  0 "$GEN" rms "$WORK/pf875.nii" 614.525105 1e-6
+# The full-Fourier answer for the same fixture, made HERE rather than reused from
+# further down: it is both the "-pF absent changes nothing" anchor and the thing
+# 7/8 has to differ from, and a file produced later would order this wrongly.
+check "no -pF still runs"         0 "$BIN" "$M" "$WORK/dgnopf.nii" -quiet -degibbs o
+"$GEN" cmp "$WORK/pf875.nii" "$WORK/dgnopf.nii" 0 >/dev/null 2>&1; sv_rc=$?
+if [ "$sv_rc" -eq 1 ]; then ok "-pF 7/8 differs from full k-space"
+elif [ "$sv_rc" -eq 0 ]; then bad "-pF 7/8 returned the full-Fourier answer"
+else bad "7/8 comparison failed to run (cmp exit $sv_rc)"; fi
+check "-pF rejects out of range"  1 "$BIN" "$M" "$WORK/o.nii" -quiet -degibbs o -pF 1.5
+check "-pF rejects junk"          1 "$BIN" "$M" "$WORK/o.nii" -quiet -degibbs o -pF abc
+# In range, plausible, and NOT implemented.  Same branch and same message as 1.5
+# -- there is no separate range check, deliberately, since dn_degibbs_check owns
+# which factors exist.  Both are kept because they are different value CLASSES a
+# user actually types, not because the refusals differ.
+check "-pF rejects unimplemented" 1 "$BIN" "$M" "$WORK/o.nii" -quiet -degibbs o -pF 0.9
+# The 9x9x3 fixture has an ODD y dimension, which the 6/8 pipeline cannot split
+# into odd and even columns of equal length.
+check "-pF refuses odd y"         1 "$BIN" "$M" "$WORK/o.nii" -quiet -degibbs o -pF 0.75
+# The OTHER geometry refusal: y is big enough for the plain method but its -pF
+# interleave is not.  A distinct branch from the odd-y and minimum-dimension ones
+# above, reachable with real data at either factor, and reached by no other
+# fixture -- 9x6x3 clears DG_MIN_DIM and then splits to 3 (6/8) and 4 (7/8).
+"$GEN" mk mag-shorty "$WORK/mag-shorty.nii" || exit 1
+check "-pF 6/8 refuses a short interleave" 1 "$BIN" "$WORK/mag-shorty.nii" "$WORK/o.nii" -quiet -degibbs o -pF 0.75
+check "-pF 7/8 refuses a short interleave" 1 "$BIN" "$WORK/mag-shorty.nii" "$WORK/o.nii" -quiet -degibbs o -pF 0.875
+# ...and the same fixture must still degibbs fine at full k-space, so the
+# refusals above are about the interleave and not about the fixture.
+check "short-y fixture runs full k-space"  0 "$BIN" "$WORK/mag-shorty.nii" "$WORK/shorty.nii" -quiet -degibbs o
+# ...so 6/8 needs an even-y fixture, and without one the whole 6/8 SUCCESS
+# path -- half-length axis, strided sub-image -- was executed by no test at all.
+"$GEN" mk mag-even "$WORK/mag-even.nii" || exit 1
+check "-pF 6/8 runs"              0 "$BIN" "$WORK/mag-even.nii" "$WORK/pf75.nii" -quiet -degibbs o -pF 0.75
+check "-pF 6/8 RMS is unchanged"  0 "$GEN" rms "$WORK/pf75.nii" 421.277497 1e-6
+check "even-y full k-space runs"  0 "$BIN" "$WORK/mag-even.nii" "$WORK/e_full.nii" -quiet -degibbs o
+"$GEN" cmp "$WORK/pf75.nii" "$WORK/e_full.nii" 0 >/dev/null 2>&1; sv_rc=$?
+if [ "$sv_rc" -eq 1 ]; then ok "-pF 6/8 differs from full k-space"
+elif [ "$sv_rc" -eq 0 ]; then bad "-pF 6/8 returned the full-Fourier answer"
+else bad "6/8 comparison failed to run (cmp exit $sv_rc)"; fi
+# The method assumes MAGNITUDE data, so negative input is TRUNCATED on the way
+# in -- truncated, not folded to +|v|, which would turn zero-mean noise into a
+# Rician-like floor.  The witness is byte-identity: degibbs of a signed field
+# must equal degibbs of the same field with the truncation already applied.  It
+# is a no-op on magnitude input, which is why every pin above is untouched by it.
+"$GEN" mk mag-signed  "$WORK/mag-signed.nii"  || exit 1
+"$GEN" mk mag-clamped "$WORK/mag-clamped.nii" || exit 1
+check "signed input runs"         0 "$BIN" "$WORK/mag-signed.nii"  "$WORK/sg_full.nii" -quiet -degibbs o
+check "pre-clamped input runs"    0 "$BIN" "$WORK/mag-clamped.nii" "$WORK/cl_full.nii" -quiet -degibbs o
+if cmp -s "$WORK/sg_full.nii" "$WORK/cl_full.nii"
+then ok "negative input is truncated before unringing"; else bad "signed and pre-clamped input gave different output"; fi
+check "signed input runs at 7/8"  0 "$BIN" "$WORK/mag-signed.nii"  "$WORK/sg78.nii" -quiet -degibbs o -pF 0.875
+check "pre-clamped input at 7/8"  0 "$BIN" "$WORK/mag-clamped.nii" "$WORK/cl78.nii" -quiet -degibbs o -pF 0.875
+if cmp -s "$WORK/sg78.nii" "$WORK/cl78.nii"
+then ok "7/8 truncates negative input too"; else bad "7/8 signed and pre-clamped input differ"; fi
+check "signed 7/8 RMS is unchanged" 0 "$GEN" rms "$WORK/sg78.nii" 413.200122 1e-6
+# Clamping the INPUT does not make the OUTPUT non-negative, and must not be
+# mistaken for doing so: ringing correction undershoots, and the conventional
+# path keeps that undershoot exactly as mrdegibbs does.  7/8 is the one path that
+# also clamps its output, matching its own reference.
+check "conventional output may go negative" 0 "$GEN" neg "$WORK/sg_full.nii"
+check "7/8 output has no negatives" 1 "$GEN" neg "$WORK/sg78.nii"
 # "only" is the one mode that takes a 3D image: the >= 2 volume rule belongs to
 # the denoiser, which is not running.  The mask fixture is the single-volume one.
 check "-degibbs o accepts 3D"     0 "$BIN" "$WORK/mask.nii" "$WORK/dg3d.nii" -quiet -degibbs o

@@ -49,17 +49,18 @@ fetch() {
 
 # time_it <label> <output> <command...>
 #
-# The command must write to $PART, which time_it sets from <output> BEFORE the
-# arguments are expanded -- callers spell it "$PART" and it lands as
-# name.part.nii.gz.  The suffix goes in the MIDDLE, not on the end: MRtrix infers
-# format from the extension and rejects "denoised.nii.gz.part" outright, and
-# nifti_io would quietly pick a different format for it.
+# The command must write to $PART, which the CALLER assigns just above each
+# time_it line -- time_it only reads it, and nothing checks the two agree.  The
+# suffix goes in the MIDDLE, not on the end: MRtrix infers format from the
+# extension and rejects "denoised.nii.gz.part" outright, and nifti_io would
+# quietly pick a different format for it.
 #
 # The temporary exists because a bare existence test cannot tell a finished
 # output from one interrupted mid-write: both tools stream .nii.gz to disk, so a
 # Ctrl-C leaves a truncated NON-EMPTY file that a later run would skip, then
-# benchmark and animate as if it were complete.  Records into $TIMINGS keyed by
-# label, so a resumed run keeps the rows it already has.
+# benchmark and animate as if it were complete.  APPENDS to $TIMINGS, and only
+# for legs that actually ran -- a resumed run skips the finished ones, so it adds
+# no duplicate row for them.
 time_it() {
 	label=$1; out=$2; shift 2
 	if [ -s "$out" ]; then

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MP-PCA denoising with DIPY, for the benchmark table in the root README.
+"""MP-PCA denoising with DIPY, for comparison against the root README benchmark.
 
     python3 benchmark/dipy_mppca.py <in.nii.gz> <out.nii.gz>
 
@@ -7,9 +7,9 @@ patch_radius=2 is a 5x5x5 window, matching what svht_denoise selects
 automatically for a 36-volume series (smallest odd k with k^3 > N) and what
 dwidenoise uses by default -- the three are compared on the same patch.
 
-Timed as a whole process, like the other rows in that table, so the figure
-includes interpreter startup and imports. That is what a user waits for; the
-in-process split is printed on stderr so the two can be told apart.
+Timed as a whole process, so the figure includes interpreter startup and
+imports. That is what a user waits for; the in-process split is printed on
+stderr so the two can be told apart.
 """
 import sys
 import time

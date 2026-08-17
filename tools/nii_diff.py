@@ -9,7 +9,6 @@ import gzip
 import struct
 import numpy as np
 
-DT_NAMES = {2: "uint8", 4: "int16", 8: "int32", 16: "float32", 64: "float64", 512: "uint16"}
 DT_FMT = {2: "u1", 4: "i2", 8: "i4", 16: "f4", 64: "f8", 512: "u2"}
 
 
@@ -48,10 +47,15 @@ def read_nii(path):
     if offset + count * np_dtype.itemsize > len(raw):
         raise ValueError(f"{path}: file truncated relative to header dims")
 
+    # Trailing singleton dimensions are not a real difference: some tools write
+    # a 3D volume as (x,y,z,1). Drop them so such a pair still compares.
+    while len(shape) > 3 and shape[-1] == 1:
+        shape = shape[:-1]
+
     data = np.frombuffer(raw, dtype=np_dtype, count=count, offset=offset).astype(np.float64)
     if scl_slope != 0:
         data = data * scl_slope + scl_inter
-    return data, shape, DT_NAMES[datatype]
+    return data, shape, np_dtype.name
 
 
 def main():
@@ -61,17 +65,16 @@ def main():
     p.add_argument("--thresh", type=float, default=1e-4,
                    help="report voxels differing by more than this times RMS(a) (default: 1e-4)")
     opts = p.parse_args()
-    args, thresh = [opts.a, opts.b], opts.thresh
 
     try:
-        a, shape_a, dtype_a = read_nii(args[0])
-        b, shape_b, dtype_b = read_nii(args[1])
+        a, shape_a, dtype_a = read_nii(opts.a)
+        b, shape_b, dtype_b = read_nii(opts.b)
     except (OSError, ValueError) as ex:
         print(f"error: {ex}", file=sys.stderr)
         sys.exit(2)
 
-    print(f"a: {args[0]}  shape={shape_a}  dtype={dtype_a}")
-    print(f"b: {args[1]}  shape={shape_b}  dtype={dtype_b}")
+    print(f"a: {opts.a}  shape={shape_a}  dtype={dtype_a}")
+    print(f"b: {opts.b}  shape={shape_b}  dtype={dtype_b}")
     if shape_a != shape_b:
         print(f"error: shape mismatch {shape_a} vs {shape_b}", file=sys.stderr)
         sys.exit(2)
@@ -96,10 +99,10 @@ def main():
     rel_l2 = norm_diff / norm_a if norm_a != 0 else float("nan")
     print(f"relative L2: {rel_l2:.6g}")
 
-    mask = abs_diff > thresh * rms_a
+    mask = abs_diff > opts.thresh * rms_a
     n_diff = int(np.sum(mask))
     pct = 100.0 * n_diff / a.size
-    print(f"voxels with |a-b| > {thresh:g}*RMS(a): {n_diff} ({pct:.4g}%)")
+    print(f"voxels with |a-b| > {opts.thresh:g}*RMS(a): {n_diff} ({pct:.4g}%)")
 
     if n_diff > 0:
         coords = np.unravel_index(np.flatnonzero(mask), shape_a, order="F")

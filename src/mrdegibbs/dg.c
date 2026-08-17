@@ -15,6 +15,16 @@
  * below.  The transform IS carried over, from the kissfft backend Eigen::FFT
  * uses -- adapted into dg_fft.c beside this file, which see.
  *
+ * THE PARTIAL-FOURIER (-pF) CODE BELOW IS NOT MRtrix3's, and the copyright line
+ * that follows does not reach it: mrdegibbs has no such option.  It is an
+ * independent implementation of the RPG method of
+ *   Lee H-H, Novikov DS, Fieremans E.  Removal of partial Fourier-induced Gibbs
+ *   (RPG) ringing artifacts in MRI.  Magn Reson Med 2021; 86:2733-2750,
+ * written from the paper and a procedural description; no code from the authors'
+ * toolbox or from TORTOISE was read.  Its reasoning is inline at the two plane
+ * functions rather than here, because it is per-factor: 6/8 reduces to the
+ * ordinary method on odd and even columns, 7/8 is a resampling construction.
+ *
  * Copyright (c) 2008-2025 the MRtrix3 contributors.
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
@@ -52,6 +62,7 @@
 
 #include <complex.h>
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -75,6 +86,11 @@
 // stay non-negative before the modulo.  mrdegibbs itself guards nothing, so this
 // is the arithmetic bound and not a judgement about what is clinically useful.
 #define DG_MIN_DIM (DG_MAXW + 2)
+
+// Distinct transform lengths dn_degibbs can ask for: nx, ny, and one for 6/8 or
+// two for 7/8.  Sized by the number of axis_get CALLS rather than by how many
+// can fire, so the bound is something a reader can count.
+#define DG_MAX_AXES 5
 
 // Written out rather than taken from M_PI, which is not in C99's <math.h>.
 // Same value as MRtrix's Math::pi.
@@ -148,6 +164,23 @@ static int axis_init(dg_axis *a, int n) {
 	return 0;
 }
 
+// The axis for length `n`, built once and then reused, since an axis depends on
+// nothing else.  NULL, having reported, if it cannot be allocated -- or if `cap`
+// is exhausted, which is a bug rather than a runtime condition but is checked
+// here so the array bound does not rest on counting call sites correctly.
+static const dg_axis *axis_get(dg_axis *v, int *nv, int cap, int n) {
+	for (int i = 0; i < *nv; i++) if (v[i].n == n) return &v[i];
+	if (*nv >= cap) {
+		dn_err("degibbs asked for more than %d transform lengths\n", cap);
+		return NULL;
+	}
+	if (axis_init(&v[*nv], n)) {
+		dn_err("cannot allocate the %d-point transform\n", n);
+		return NULL;
+	}
+	return &v[(*nv)++];
+}
+
 // One line's worth of the reference's unring_1d inner body: pick the subvoxel
 // shift that minimises total variation either side of each sample, and
 // interpolate to it.  `sh` is the 41 shifted copies, sh[j*n + l]; the result
@@ -206,6 +239,7 @@ typedef struct {
 	dcx *a, *b;                        // nx*ny each
 	dcx *s;                            // the 41 shifted copies: 41 * max(nx,ny)
 	dcx *line, *spec, *tmp, *fftscr;   // max(nx,ny) each
+	float *up;                         // 7/8: the 3x upsampled plane
 } dg_scratch;
 
 // Unring `im` along one axis.  `im` is a column-major nx-by-ny plane with
@@ -248,10 +282,11 @@ static void plane_lines(const dg_axis *ax, const dg_scratch *w, dcx *im, int ld,
 static void scratch_free(dg_scratch *w) {
 	free(w->a); free(w->b); free(w->s);
 	free(w->line); free(w->spec); free(w->tmp); free(w->fftscr);
+	free(w->up);
 	memset(w, 0, sizeof(*w));
 }
 
-static int scratch_init(dg_scratch *w, int nx, int ny) {
+static int scratch_init(dg_scratch *w, int nx, int ny, double pf) {
 	memset(w, 0, sizeof(*w));
 	const size_t np = (size_t)nx*(size_t)ny;
 	// The x pass runs ny lines of length nx and the y pass nx of length ny, so
@@ -269,13 +304,19 @@ static int scratch_init(dg_scratch *w, int nx, int ny) {
 	if (!w->a || !w->b || !w->s || !w->line || !w->spec || !w->tmp || !w->fftscr) {
 		scratch_free(w); return 1;
 	}
+	// 7/8 RPG expands y threefold; the interleave it also needs lives in the
+	// caller's plane, which is dead for exactly that span.  Tested separately
+	// because a NULL here is legitimate off the 7/8 path.
+	if (pf == DG_PF_7_8 && !(w->up = (float *)dn_malloc(3*np, sizeof(float)))) {
+		scratch_free(w); return 1;
+	}
 	return 0;
 }
 
 // One (z, volume) plane, in place: `p` is both source and destination, which is
 // safe because the plane is copied into scratch before anything is written back.
-static void plane_run(const dg_axis *ax, const dg_axis *ay, dg_scratch *w,
-                      float *p, int nx, int ny) {
+static void plane_run(const dg_axis *ax, const dg_axis *ay, const dg_axis *ay2,
+                      dg_scratch *w, float *p, int nx, int ny) {
 	const size_t np = (size_t)nx*(size_t)ny;
 
 	for (size_t i = 0; i < np; i++) w->a[i] = (double)p[i];
@@ -310,13 +351,97 @@ static void plane_run(const dg_axis *ax, const dg_axis *ay, dg_scratch *w,
 	unring(ax, w, im1, nx, ny, 0);
 	unring(ay, w, im2, nx, nx, 1);
 
+	// PARTIAL FOURIER.  Asymmetric truncation at -v*Kmax and +Kmax, v = 2*pf-1,
+	// makes the point spread function a superposition of TWO sincs (Lee et al.
+	// 2021, Eq 5), of intervals dy and dy/v.  They superpose, so they come out
+	// independently -- the conventional method applied twice.  At pf = 6/8,
+	// v = 1/2 and the second interval is 2*dy, which on the odd and even
+	// y-columns taken separately IS dy: the ordinary method applies unchanged.
+	//
+	// This needs no new kernel.  `unring` and `plane_lines` already take the
+	// element stride as `ld`, so a sub-image is `im2 + par*nx` with `ld = 2*nx`
+	// and a half-length axis.  The forward transform is needed because unring
+	// consumes a spectrum and `im2` is spatial by this point.
+	//
+	// Only the y half is treated.  The x half keeps the wide ringing, as the
+	// paper notes: no filter can suppress both y_r and y_v at once.
+	if (ay2) {
+		for (int par = 0; par < 2; par++) {
+			dcx *sub = im2 + (size_t)par*nx;
+			plane_lines(ay2, w, sub, 2*nx, nx, 1, 0);
+			unring(ay2, w, sub, 2*nx, nx, 1);
+		}
+	}
+
 	for (size_t i = 0; i < np; i++) p[i] = (float)(creal(im1[i]) + creal(im2[i]));
+}
+
+// RPG at 7/8 follows Lee et al.'s resampling construction: expand the
+// phase-encode grid by three, SuShi each of four interleaves, contract to the
+// original grid, then remove the remaining ordinary y ringing with one 1-D
+// pass.  The repeated values are nearest-neighbour samples; positions 3k+1 are
+// exactly the original sample centres, so that is the matching downsample.
+static void plane_run_7_8(const dg_axis *ax, const dg_axis *ay,
+                           const dg_axis *ay78, const dg_axis *ay78short,
+                           dg_scratch *w,
+                           float *p, int nx, int ny) {
+	const size_t np = (size_t)nx*(size_t)ny;
+	const int ny3 = 3*ny;
+	float *const up = w->up;
+	// `p` itself is the interleave buffer: it is dead from the expansion below
+	// until the downsample at the end rewrites every row of it, and an interleave
+	// is ceil(3ny/4) <= ny rows, so it fits.  A fourth plane of scratch bought
+	// nothing but a smaller worker cap.
+	float *const sub = p;
+
+	for (int k = 0; k < ny; k++) {
+		for (int r = 0; r < 3; r++)
+			memcpy(up + (size_t)(3*k + r)*nx, p + (size_t)k*nx,
+			       (size_t)nx*sizeof(*p));
+	}
+	for (int par = 0; par < 4; par++) {
+		const int nsub = (ny3 - par + 3)/4;
+		const dg_axis *const asub = nsub == ay78->n ? ay78 : ay78short;
+		for (int k = 0; k < nsub; k++)
+			memcpy(sub + (size_t)k*nx, up + (size_t)(par + 4*k)*nx,
+			       (size_t)nx*sizeof(*p));
+		plane_run(ax, asub, NULL, w, sub, nx, nsub);
+		for (int k = 0; k < nsub; k++)
+			memcpy(up + (size_t)(par + 4*k)*nx, sub + (size_t)k*nx,
+			       (size_t)nx*sizeof(*p));
+	}
+	for (int k = 0; k < ny; k++)
+		memcpy(p + (size_t)k*nx, up + (size_t)(3*k + 1)*nx,
+		       (size_t)nx*sizeof(*p));
+
+	// `unring` takes a y-spectrum and leaves a spatial line.  This is the final
+	// ordinary-ringing pass after the four interleaves have removed the wider PF
+	// component.
+	for (size_t i = 0; i < np; i++) w->a[i] = (double)p[i];
+	plane_lines(ay, w, w->a, nx, nx, 1, 0);
+	unring(ay, w, w->a, nx, nx, 1);
+
+	// Clamped because THE REFERENCE CLAMPS: dropping this moves the phantom output
+	// by relative L2 1.3e-4, where the clamped output agrees with the reference to
+	// 1.6e-6.  Note these negatives are ringing UNDERSHOOT created by the
+	// transform, not noise about zero -- the input was already truncated in
+	// dn_degibbs, so the argument made there does not apply here.  Neither the
+	// conventional path nor 6/8 has an equivalent step, and giving them one would
+	// cost byte-identity with mrdegibbs, which does not clamp.
+	for (size_t i = 0; i < np; i++) {
+		const double v = creal(w->a[i]);
+		p[i] = (float)(v > 0.0 ? v : 0.0);
+	}
 }
 
 typedef struct {
 	const dg_axis *ax, *ay;
+	const dg_axis *ay2;      // half-length y axis for partial Fourier, or NULL
+	const dg_axis *ay78;     // 3/4-length y axis for 7/8 partial Fourier, or NULL
+	const dg_axis *ay78short;// shorter 7/8 interleave; == ay78 when the two coincide
 	float *data;
 	int nx, ny;
+	double pf;
 	size_t nplane, npix;
 	pthread_mutex_t lock;
 	size_t next;
@@ -327,7 +452,7 @@ static void *dg_worker(void *arg) {
 	dg_pool *pool = (dg_pool *)arg;
 	dg_scratch w;
 
-	if (scratch_init(&w, pool->nx, pool->ny)) {
+	if (scratch_init(&w, pool->nx, pool->ny, pool->pf)) {
 		pthread_mutex_lock(&pool->lock);
 		pool->failed = 1;
 		pthread_mutex_unlock(&pool->lock);
@@ -341,30 +466,77 @@ static void *dg_worker(void *arg) {
 		const size_t p = (pool->failed || pool->next >= pool->nplane) ? pool->nplane : pool->next++;
 		pthread_mutex_unlock(&pool->lock);
 		if (p >= pool->nplane) break;
-		plane_run(pool->ax, pool->ay, &w, pool->data + p*pool->npix, pool->nx, pool->ny);
+		if (pool->pf == DG_PF_7_8)
+			plane_run_7_8(pool->ax, pool->ay, pool->ay78, pool->ay78short, &w,
+			              pool->data + p*pool->npix, pool->nx, pool->ny);
+		else
+			plane_run(pool->ax, pool->ay, pool->ay2, &w, pool->data + p*pool->npix,
+			          pool->nx, pool->ny);
 	}
 
 	scratch_free(&w);
 	return NULL;
 }
 
-int dn_degibbs_check(int nx, int ny) {
+int dn_degibbs_check(int nx, int ny, double pf) {
 	if (nx < DG_MIN_DIM || ny < DG_MIN_DIM) {
 		dn_err("-degibbs needs in-plane dimensions of at least %d (got %d x %d)\n",
 		       DG_MIN_DIM, nx, ny);
+		return 1;
+	}
+	if (pf == DG_PF_FULL) return 0;
+	if (pf != DG_PF_6_8 && pf != DG_PF_7_8) {
+		// The pipeline differs per factor rather than varying continuously, so
+		// the nearest implemented one is NOT a safe substitute.
+		// %.9g on the value: %g rounds to 6 significant digits, so -pF 0.750000001
+		// was refused with a message naming 0.75 as both the input and a supported
+		// factor.  The two constants are exact, so %g is right for them.
+		dn_err("-pF %.9g is not implemented; this build supports %g (7/8) and %g (6/8)\n",
+		       pf, DG_PF_7_8, DG_PF_6_8);
+		return 1;
+	}
+	if (pf == DG_PF_6_8 && ny % 2) {
+		// The 6/8 pipeline splits y into odd and even columns; an odd count
+		// makes the two halves different lengths, which nothing here handles.
+		dn_err("-pF %g needs an even y dimension (got %d)\n", pf, ny);
+		return 1;
+	}
+	// 7/8 forms 3*ny + 3 as int, and dn_image_read admits a dimension all the way
+	// to INT32_MAX.  Reaching this needs a ~16 GB file, so nothing real comes
+	// close -- but the overflow would be undefined behaviour rather than a clean
+	// allocation failure, so it is refused here beside the other arithmetic bound.
+	if (pf == DG_PF_7_8 && ny > (INT_MAX - 3)/3) {
+		dn_err("-pF %g cannot handle a y dimension of %d\n", pf, ny);
+		return 1;
+	}
+	// The 6/8 sibling: plane_run strides its sub-image by 2*nx, also in int.
+	// Needs a 4 GB plane to reach, but leaving one of the pair guarded and the
+	// other not is worse than guarding neither.
+	if (pf == DG_PF_6_8 && nx > INT_MAX/2) {
+		dn_err("-pF %g cannot handle an x dimension of %d\n", pf, nx);
+		return 1;
+	}
+	const int ysub = pf == DG_PF_6_8 ? ny/2 : 3*ny/4;
+	if (ysub < DG_MIN_DIM) {
+		dn_err("-pF %g makes its interleave y dimension fall below %d (got %d)\n",
+		       pf, DG_MIN_DIM, ysub);
 		return 1;
 	}
 	return 0;
 }
 
 // Scratch bytes per worker, to the dominant term.  Two planes, the 41 shifted
-// copies of one line, and four line-length temporaries.
-static size_t dg_worker_bytes(int nx, int ny) {
+// copies of one line, four line-length temporaries, and at 7/8 the threefold
+// y expansion.  Must track scratch_init exactly: pricing a worker low lets the
+// 1 GiB cap admit more of them than the budget allows.
+static size_t dg_worker_bytes(int nx, int ny, double pf) {
 	const size_t nmax = (size_t)((nx > ny) ? nx : ny);
-	return (2*(size_t)nx*(size_t)ny + (DG_NSHIFT + 4)*nmax) * sizeof(dcx);
+	size_t bytes = (2*(size_t)nx*(size_t)ny + (DG_NSHIFT + 4)*nmax) * sizeof(dcx);
+	if (pf == DG_PF_7_8) bytes += 3*(size_t)nx*(size_t)ny*sizeof(float);
+	return bytes;
 }
 
-int dn_degibbs_threads(int nx, int ny, int nz, int nvol, int requested) {
+int dn_degibbs_threads(int nx, int ny, int nz, int nvol, int requested, double pf) {
 	if (requested < 1) requested = 1;
 	const int hw = dn_default_threads();
 	if (requested > hw) requested = hw;
@@ -375,7 +547,7 @@ int dn_degibbs_threads(int nx, int ny, int nz, int nvol, int requested) {
 	// Same 1 GiB total budget the denoiser uses.  Unbounded, this is 34 MB per
 	// worker at 1024 in plane and 134 MB at 2048 -- an audit found it capped by
 	// nothing but the core count.
-	const size_t per = dg_worker_bytes(nx, ny);
+	const size_t per = dg_worker_bytes(nx, ny, pf);
 	const size_t budget = (size_t)1 << 30;
 	if (per > 0 && (size_t)requested * per > budget) {
 		const int cap = (int)(budget / per);
@@ -384,28 +556,70 @@ int dn_degibbs_threads(int nx, int ny, int nz, int nvol, int requested) {
 	return requested;
 }
 
-int dn_degibbs(float *data, int nx, int ny, int nz, int nvol, int nthreads) {
+int dn_degibbs(float *data, int nx, int ny, int nz, int nvol, int nthreads, double pf) {
 	if (!data || nz < 1 || nvol < 1) return 1;
-	if (dn_degibbs_check(nx, ny)) return 1;
-	// Capped here as well as at the CLI, so the budget holds however it is called.
-	nthreads = dn_degibbs_threads(nx, ny, nz, nvol, nthreads);
+	if (dn_degibbs_check(nx, ny, pf)) return 1;
 
-	dg_axis ax, ay;
-	if (axis_init(&ax, nx)) { dn_err("cannot allocate the %d-point transform\n", nx); return 1; }
-	const int share = (ny == nx);
-	if (!share && axis_init(&ay, ny)) {
-		dn_err("cannot allocate the %d-point transform\n", ny);
-		axis_free(&ax);
+	// THE METHOD ASSUMES MAGNITUDE DATA, so the input is made to satisfy that
+	// rather than the assumption being left implicit.  A negative here is a noise
+	// fluctuation about a true zero; it is TRUNCATED, not folded to +|v|, which
+	// would turn zero-mean noise into a Rician-like positive floor and hand the
+	// TV window spurious steps to fit.  A flat zero baseline is what the subvoxel
+	// shift search wants in background regions.
+	//
+	// No-op on magnitude input, which is why byte-identity with mrdegibbs is
+	// unaffected: only a caller that fed signed data -- a phase-rotated series --
+	// sees any change, and that caller was violating the assumption already.
+	//
+	// fmaxf, NOT `if (data[i] < 0.0f) data[i] = 0.0f`, and the difference is
+	// worth stating because the second form looks equivalent and is not:
+	//   - It DOES NOT VECTORISE: turning a conditional store into an unconditional
+	//     one would invent a write C11 forbids, so clang emits a scalar
+	//     compare-and-branch per element.  2.1x, and AGENTS.md carries the figures.
+	//   - fmaxf maps NaN and -Inf to 0 where the comparison preserves them, which
+	//     is wanted: a NaN here would poison every downstream analysis.  +Inf is
+	//     NOT touched.  The CLI refuses non-finite input at read time, so this
+	//     binds a direct caller -- and `-degibbs y` hands over the denoiser's
+	//     output buffer, not the one that check ran on.
+	{
+		const size_t n = (size_t)nx*(size_t)ny*(size_t)nz*(size_t)nvol;
+		for (size_t i = 0; i < n; i++) data[i] = fmaxf(data[i], 0.0f);
+	}
+	// Capped here as well as at the CLI, so the budget holds however it is called.
+	nthreads = dn_degibbs_threads(nx, ny, nz, nvol, nthreads, pf);
+
+	// Every transform length needed, deduplicated by length.  A square plane
+	// wants one axis rather than two, and so do the 7/8 interleaves when their
+	// two lengths coincide -- one rule covers both, and also the case ny/2 == nx,
+	// which used to build a second identical axis.  At most four distinct lengths
+	// are ever asked for: nx, ny, plus one for 6/8 or two for 7/8.
+	// At most four of these five fire -- 6/8 and 7/8 are mutually exclusive -- and
+	// axis_get refuses past DG_MAX_AXES either way.  nav counts successes, so it
+	// bounds both the NULL check and the teardown.
+	dg_axis av[DG_MAX_AXES];
+	int nav = 0;
+	const dg_axis *const ax  = axis_get(av, &nav, DG_MAX_AXES, nx);
+	const dg_axis *const ay  = axis_get(av, &nav, DG_MAX_AXES, ny);
+	const dg_axis *const ay2 = pf == DG_PF_6_8 ? axis_get(av, &nav, DG_MAX_AXES, ny/2) : NULL;
+	const dg_axis *const ay78  = pf == DG_PF_7_8 ? axis_get(av, &nav, DG_MAX_AXES, (3*ny + 3)/4) : NULL;
+	const dg_axis *const ay78s = pf == DG_PF_7_8 ? axis_get(av, &nav, DG_MAX_AXES, 3*ny/4) : NULL;
+	if (!ax || !ay || (pf == DG_PF_6_8 && !ay2) ||
+	    (pf == DG_PF_7_8 && (!ay78 || !ay78s))) {
+		for (int i = 0; i < nav; i++) axis_free(&av[i]);
 		return 1;
 	}
 
 	dg_pool pool;
 	memset(&pool, 0, sizeof(pool));
-	pool.ax     = &ax;
-	pool.ay     = share ? &ax : &ay;
+	pool.ax     = ax;
+	pool.ay     = ay;
+	pool.ay2    = ay2;
+	pool.ay78   = ay78;
+	pool.ay78short = ay78s;
 	pool.data   = data;
 	pool.nx     = nx;
 	pool.ny     = ny;
+	pool.pf     = pf;
 	pool.npix   = (size_t)nx*(size_t)ny;
 	pool.nplane = (size_t)nz*(size_t)nvol;
 
@@ -422,7 +636,6 @@ int dn_degibbs(float *data, int nx, int ny, int nz, int nvol, int nthreads) {
 		dn_err("a degibbs worker could not allocate its scratch space\n");
 		rc = 1;
 	}
-	axis_free(&ax);
-	if (!share) axis_free(&ay);
+	for (int i = 0; i < nav; i++) axis_free(&av[i]);
 	return rc;
 }

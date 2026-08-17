@@ -22,6 +22,13 @@
 #include "dn_run.h"
 #ifdef DN_DEGIBBS
 #include "mrdegibbs/dg.h"
+
+// The factor as the fraction everyone writes, for the run summary: -help and the
+// README both say 7/8 and 6/8, not 0.875 and 0.75.  Empty for full k-space.
+static const char *pf_note(double pf) {
+	return pf == DG_PF_6_8 ? ", partial Fourier 6/8"
+	     : pf == DG_PF_7_8 ? ", partial Fourier 7/8" : "";
+}
 #endif
 
 #define DN_VERSION "0.1.20260813"
@@ -50,7 +57,12 @@ static void usage(void) {
 	printf("                    of a magnitude image, so the low-SNR noise floor is\n");
 	printf("                    avoided instead of denoised.  The phase must match the\n");
 	printf("                    input in dimensions and world transform.\n");
+#ifdef DN_DEGIBBS
+	printf("                    The OUTPUT IS THEN SIGNED, unless -degibbs is also\n");
+	printf("                    given, which gives that up.  If the phase turns out to\n");
+#else
 	printf("                    The OUTPUT IS THEN SIGNED.  If the phase turns out to\n");
+#endif
 	printf("                    encode no rotation at all, that is reported rather than\n");
 	printf("                    silently returning the magnitude.\n");
 	printf("  -phaseunits <u>   how to read the phase values: radians, degrees, turns\n");
@@ -64,7 +76,7 @@ static void usage(void) {
 	printf("                    does not cover one: a range of -0.5 to 0.5 is half a\n");
 	printf("                    radian or one whole cycle, and the file cannot say.\n");
 	printf("                    The convention used is reported unless -quiet, so\n");
-	printf("                    check it.\n");
+	printf("                    check it.  Needs -phase.\n");
 	printf("  -real <image>     write the real-axis-rotated input, before denoising\n");
 	printf("                    (float32).  Needs -phase.\n");
 	printf("  -mask <image>     only denoise voxels where the mask is > 0.\n");
@@ -80,9 +92,27 @@ static void usage(void) {
 	printf("                    (default) or only.  \"yes\" denoises first and degibbses\n");
 	printf("                    the result, which is the order these belong in; \"only\"\n");
 	printf("                    skips the denoising entirely and accepts a 3D image.\n");
-	printf("                    Do NOT use on partial Fourier acquisitions.\n");
+	printf("                    Use -pF 0.875 or 0.75 for supported partial-Fourier\n");
+	printf("                    acquisitions; without it this assumes full k-space.\n");
+	printf("                    Assumes MAGNITUDE data: negative input is truncated to\n");
+	printf("                    zero, which is a no-op on a magnitude image and lossy on\n");
+	printf("                    a -phase rotated one.  The output can still go negative,\n");
+	printf("                    because ringing correction undershoots -- except under\n");
+	printf("                    -pF 0.875, which clamps its output as its reference does.\n");
+	printf("                    In-plane dimensions must be at least 5, and at least 5\n");
+	printf("                    again after a -pF factor splits them.\n");
+	printf("                    \"only\" also refuses -noise, -rank, -phase, -real and\n");
+	printf("                    -extent, which all describe a denoiser it is not running.\n");
+	printf("                    Cannot be combined with -mask: a mask leaves a hard\n");
+	printf("                    zero edge, which is exactly what this method rings on.\n");
 	printf("                    Within-slice axes are x and y.  Adapted from MRtrix3\n");
 	printf("                    mrdegibbs (MPL-2.0); method of Kellner et al. 2016.\n");
+	printf("  -pF <factor>      partial-Fourier factor: 0.875 (7/8) or 0.75 (6/8).\n");
+	printf("                    Asymmetric k-space truncation adds a SECOND ringing along\n");
+	printf("                    y that -degibbs alone leaves in place; this removes it too\n");
+	printf("                    (Lee et al. 2021).  Needs -degibbs, assumes y is the\n");
+	printf("                    phase-encode direction, and 6/8 needs an even y dimension.\n");
+	printf("                    1.0 is accepted and means full k-space, the default.\n");
 #endif
 	printf("  -nthreads <n>     worker threads (default: all cores). -p is an alias.\n");
 	printf("  -quiet            suppress the run summary on stderr\n");
@@ -326,6 +356,14 @@ int main(int argc, char *argv[]) {
 	// every other value the help text calls invalid -- 2, -1 -- was rejected.
 	int extent = 0, extent_given = 0, nthreads = 0, quiet = 0;
 	int degibbs = DN_DG_NO;
+#ifdef DN_DEGIBBS
+	// pf_given, not `pf != DG_PF_FULL`, is what separates "not supplied" from
+	// "supplied as 1.0" -- the same distinction -extent and -phaseunits draw, and
+	// without it an explicit `-pF 1.0` was the one factor accepted with no
+	// -degibbs to act on it.
+	double pf = DG_PF_FULL;   // symmetric k-space
+	int pf_given = 0;
+#endif
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
@@ -362,8 +400,8 @@ int main(int argc, char *argv[]) {
 					return EXIT_FAILURE;
 				}
 			}
-			else if (!strcmp(a, "-degibbs")) {
 #ifdef DN_DEGIBBS
+			else if (!strcmp(a, "-degibbs")) {
 				if (!strcmp(v, "y")) degibbs = DN_DG_YES;
 				else if (!strcmp(v, "n")) degibbs = DN_DG_NO;
 				else if (!strcmp(v, "o")) degibbs = DN_DG_ONLY;
@@ -371,13 +409,29 @@ int main(int argc, char *argv[]) {
 					dn_err("-degibbs must be y, n or o (got '%s')\n", v);
 					return EXIT_FAILURE;
 				}
+			}
+			else if (!strcmp(a, "-pF")) {
+				char *pend = NULL;
+				pf = strtod(v, &pend);
+				// Only the PARSE is checked here.  Which factors exist is
+				// dn_degibbs_check's to say, and it says it precisely; a range
+				// test here told a user that 0.9 was acceptable, then a second
+				// message refused it.
+				if (*pend != '\0' || pend == v) {
+					dn_err("-pF needs a partial-Fourier factor (got '%s')\n", v);
+					return EXIT_FAILURE;
+				}
+				pf_given = 1;
+			}
 #else
-				(void)v;
-				dn_err("-degibbs is not compiled into this build.\n");
+			// One refusal for both, since the message is the same and `a` names
+			// whichever was given.
+			else if (!strcmp(a, "-degibbs") || !strcmp(a, "-pF")) {
+				dn_err("%s is not compiled into this build.\n", a);
 				dn_err("  Rebuild with 'make DEGIBBS=1'.\n");
 				return EXIT_FAILURE;
-#endif
 			}
+#endif
 			else if (!strcmp(a, "-extent")) {
 				if (parse_int(v, &extent)) { dn_err("-extent needs an integer (got '%s')\n", v); return EXIT_FAILURE; }
 				extent_given = 1;
@@ -452,6 +506,15 @@ int main(int argc, char *argv[]) {
 		dn_err("  Denoise with -mask, then run -degibbs o on the result if you need both.\n");
 		return EXIT_FAILURE;
 	}
+#ifdef DN_DEGIBBS
+	// -pF changes how ringing is removed, so it means nothing without a stage
+	// that removes it.  Silently ignoring it would leave PF ringing in place
+	// while the command line says otherwise.
+	if (pf_given && degibbs == DN_DG_NO) {
+		dn_err("-pF describes how -degibbs should work, but -degibbs is not enabled.\n");
+		return EXIT_FAILURE;
+	}
+#endif
 	if (punits_given && !fphase) {
 		dn_err("-phaseunits describes the -phase image, which was not given.\n");
 		return EXIT_FAILURE;
@@ -484,7 +547,7 @@ int main(int argc, char *argv[]) {
 	// Before any work, not after: this needs only the header, and reaching it
 	// from the -degibbs y call site meant a full denoise ran and was then thrown
 	// away when the geometry turned out to be unusable.
-	if (degibbs != DN_DG_NO && dn_degibbs_check(img.nx, img.ny)) goto done;
+	if (degibbs != DN_DG_NO && dn_degibbs_check(img.nx, img.ny, pf)) goto done;
 #endif
 
 #ifdef DN_DEGIBBS
@@ -495,14 +558,14 @@ int main(int argc, char *argv[]) {
 		if (nthreads < 1) nthreads = dn_default_threads();
 		// Report what will really run, not what was asked for -- same contract the
 		// denoising path has, and it was missing here.
-		nthreads = dn_degibbs_threads(img.nx, img.ny, img.nz, img.nvol, nthreads);
+		nthreads = dn_degibbs_threads(img.nx, img.ny, img.nz, img.nvol, nthreads, pf);
 		if (!quiet) {
 			dn_err("input        : %s (%dx%dx%d, %d volume%s)\n", fin,
 			        img.nx, img.ny, img.nz, img.nvol, img.nvol == 1 ? "" : "s");
-			dn_err("degibbs      : only, x-y planes (no denoising)\n");
+			dn_err("degibbs      : only, x-y planes (no denoising)%s\n", pf_note(pf));
 			dn_err("threads      : %d\n", nthreads);
 		}
-		if (dn_degibbs(img.data, img.nx, img.ny, img.nz, img.nvol, nthreads)) goto done;
+		if (dn_degibbs(img.data, img.nx, img.ny, img.nz, img.nvol, nthreads, pf)) goto done;
 		if (dn_write_f32(&img, fout, img.data, img.nvol)) goto done;
 		status = EXIT_SUCCESS;
 		goto done;
@@ -530,6 +593,13 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (nthreads < 1) nthreads = dn_default_threads();
+	// The REQUEST, kept separate from the denoiser's effective count below.
+	// -degibbs has its own cap and none of the denoiser's constraints -- no mask,
+	// no patch arena -- so handing it the throttled number would let a small mask
+	// or the eigensolver's scratch budget starve a stage limited by neither.
+#ifdef DN_DEGIBBS
+	const int nthreads_req = nthreads;
+#endif
 	// Report what will actually run, not what was asked for.
 	nthreads = dn_effective_threads(&g, n_in_mask, nthreads);
 
@@ -549,10 +619,11 @@ int main(int argc, char *argv[]) {
 		// by its own scratch budget, so the two stages can legitimately run
 		// different team sizes and one number would be wrong for one of them.
 		if (degibbs == DN_DG_YES)
-			dn_err("degibbs      : yes, x-y planes (%d threads)\n",
-			        dn_degibbs_threads(img.nx, img.ny, img.nz, img.nvol, nthreads));
+			dn_err("degibbs      : yes, x-y planes%s (%d threads)\n", pf_note(pf),
+			        dn_degibbs_threads(img.nx, img.ny, img.nz, img.nvol, nthreads_req, pf));
 #endif
 	}
+
 
 	// Before anything is allocated for the denoising, and before the first write:
 	// on failure this leaves img exactly as it was read, and the run stops with
@@ -560,6 +631,21 @@ int main(int argc, char *argv[]) {
 	// every stage below is unchanged -- the denoiser neither knows nor cares that
 	// its input is now signed.
 	if (fphase && dn_rotate_to_real(&img, fphase, punits, quiet)) goto done;
+
+#ifdef DN_DEGIBBS
+	// AFTER the rotation, so it describes a run that got this far, and OUTSIDE
+	// any -quiet test: -quiet suppresses the run SUMMARY, and dn_phase.c's
+	// whole-turn warning already establishes that a warning about the data is not
+	// a summary line.  The two options pull opposite ways -- -phase keeps
+	// background noise zero-mean and degibbs truncates it -- and a scripted
+	// -quiet run is the case that most needs telling.  One dn_err per line: it
+	// prefixes per CALL.
+	if (degibbs == DN_DG_YES && fphase) {
+		dn_err("warning: -phase output is signed, and -degibbs truncates it to zero,\n");
+		dn_err("  reinstating a positive bias in background voxels.  Use -degibbs n if\n");
+		dn_err("  the denoised series needs to stay signed.\n");
+	}
+#endif
 
 	// Zero-initialised: voxels outside the mask are never visited and must read
 	// as zero in every output.
@@ -592,7 +678,7 @@ int main(int argc, char *argv[]) {
 	// structure the denoiser models.  -noise and -rank describe the denoising and
 	// are untouched, as is -real, which is the input before either stage.
 	if (degibbs == DN_DG_YES &&
-	    dn_degibbs(out, img.nx, img.ny, img.nz, img.nvol, nthreads)) goto done;
+	    dn_degibbs(out, img.nx, img.ny, img.nz, img.nvol, nthreads_req, pf)) goto done;
 #endif
 
 	// Write the auxiliary maps first: if the disk fills, failing before the main
