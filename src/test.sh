@@ -780,6 +780,120 @@ check "two volumes refuse -noise" 1 "$BIN" "$WORK/pair.nii" "$WORK/x.nii" -quiet
 check "100 volumes on a 9x9x3 image" 0 "$BIN" "$WORK/tall.nii" "$WORK/tall_o.nii" -quiet
 check "one slice, sphere, exclusive"    0 "$BIN" "$WORK/thin.nii" "$WORK/th2.nii" -quiet -aggregator exclusive -extent 5
 
+echo "tensor mode"
+# Recursive mode-wise denoising of space x time x echo tensors, against the
+# matrix mode's own median-estimator noise map, with ME-PCA's window rules.
+# Given a KNOWN variance the kernel and windows are checked against that
+# package by tools/tensor_parity.py, which needs Python.  These pin what can
+# be pinned without it: the noise map against the fixtures' true SD of 20, the
+# window geometry, the refusals, determinism and numerical anchors.
+for k in me-1 me-2 me-3 me-clean-1 me-clean-2 me-clean-3 me-shift-2 me-tr-2 me-short-2 me-neg-2 me-mask; do
+	"$GEN" mk "$k" "$WORK/$k.nii" || { echo "fixture $k failed"; exit 1; }
+done
+E1=$WORK/me-1.nii; E2=$WORK/me-2.nii; E3=$WORK/me-3.nii
+TEN="-tensor gd -tensor_window 3,3,3"
+check "tensor: three echoes" 0 "$BIN" "$E1" "$WORK/t.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-noise "$WORK/t_noise.nii" -rank "$WORK/t_rank.nii" -snr_gain "$WORK/t_gain.nii"
+for k in 1 2 3; do
+	before=$(err "$WORK/me-$k.nii" "$WORK/me-clean-$k.nii")
+	after=$(err "$WORK/t_echo-$k.nii" "$WORK/me-clean-$k.nii")
+	if awk -v a="$after" -v b="$before" 'BEGIN { exit !(a < 0.7 * b) }'
+	then ok "tensor: echo $k closer to the truth ($before -> $after)"
+	else bad "tensor: echo $k not denoised ($before -> $after)"; fi
+done
+# The estimated noise level against the oracle: the same run at the TRUE
+# variance (SD 20) must not be much better than the map's.
+check "tensor: at the true variance" 0 "$BIN" "$E1" "$WORK/tk.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-tensor_sigma2 400
+gd_err=$(err "$WORK/t_echo-1.nii" "$WORK/me-clean-1.nii")
+or_err=$(err "$WORK/tk_echo-1.nii" "$WORK/me-clean-1.nii")
+if awk -v g="$gd_err" -v o="$or_err" 'BEGIN { exit !(g < 1.05 * o) }'
+then ok "tensor: estimated noise within 5% of the oracle's error ($gd_err against $or_err)"
+else bad "tensor: estimated noise costs too much against the oracle ($gd_err against $or_err)"; fi
+# Anchors: the arithmetic, the noise map and the ranks, so a change to any of
+# them cannot cancel out.  The map reads 20.79 against the true 20: the median
+# estimator runs ~4% high on 12-volume echoes, which costs nothing above.
+check "tensor: echo 1 RMS anchor" 0 "$GEN" rms "$WORK/t_echo-1.nii" 667.926172 1e-6
+check "tensor: noise map anchor" 0 "$GEN" rms "$WORK/t_noise.nii" 20.7888098 1e-6
+check "tensor: rank map anchor"  0 "$GEN" rms "$WORK/t_rank.nii" 1.64881504 1e-6
+check "tensor: every voxel covered" 0 "$GEN" nan "$WORK/t_noise.nii" 0
+"$BIN" "$E1" "$WORK/t1.nii" -quiet $TEN -echo "$E2" -echo "$E3" -nthreads 1 -rank "$WORK/t1_rank.nii"
+"$BIN" "$E1" "$WORK/t8.nii" $TEN -echo "$E2" -echo "$E3" -nthreads 8 -rank "$WORK/t8_rank.nii" 2>"$WORK/t8.err"
+same=1
+for f in echo-1 echo-2 echo-3 rank; do cmp -s "$WORK/t1_$f.nii" "$WORK/t8_$f.nii" || same=0; done
+# Only meaningful if more than one worker really ran, so a host that has the
+# cores must have used them; a serial-against-serial match proves nothing.
+nth=$(sed -n 's/^.*threads *: *//p' "$WORK/t8.err")
+ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+if [ "$same" -ne 1 ]; then bad "tensor: output depends on the thread count"
+elif [ "${nth:-0}" -ge 2 ]; then ok "tensor: 1 and $nth threads byte-identical"
+elif [ "$ncpu" -ge 2 ]; then bad "tensor: only ${nth:-0} worker ran on $ncpu cores, so threads were not compared"
+else ok "tensor: byte-identical (single-core host: no parallel run to compare)"; fi
+check "tensor: sigma2 0 keeps everything" 0 "$BIN" "$E1" "$WORK/t0.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_sigma2 0
+check "tensor: sigma2 0 returns the input" 0 "$GEN" rl2 "$WORK/t0_echo-2.nii" "$E2" 1e-6
+# Stride 4 with a 3-wide window: corners 0,4,8,12 in-plane cover 12 of 16, and
+# only corner 0 fits in z, covering 3 of 5 slices.  1280 - 12*12*3 = 848 voxels
+# are covered by nothing, and must read NaN in every map, one per rank volume.
+check "tensor: stride 4" 0 "$BIN" "$E1" "$WORK/ts.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_stride 4 \
+	-noise "$WORK/ts_noise.nii" -rank "$WORK/ts_rank.nii"
+check "tensor: stride 4 leaves 848 voxels uncovered" 0 "$GEN" nan "$WORK/ts_noise.nii" 848
+check "tensor: ... in every rank volume" 0 "$GEN" nan "$WORK/ts_rank.nii" 2544
+# A window is denoised when it TOUCHES the mask: corners x 1-10, y 2-11, z 0-2
+# reach it, covering 12x12x5 voxels and leaving 560.
+check "tensor: mask" 0 "$BIN" "$E1" "$WORK/tm.nii" -quiet $TEN -echo "$E2" -echo "$E3" -mask "$WORK/me-mask.nii" \
+	-noise "$WORK/tm_noise.nii"
+check "tensor: windows touching the mask cover all but 560" 0 "$GEN" nan "$WORK/tm_noise.nii" 560
+check "tensor: in-plane window" 0 "$BIN" "$E1" "$WORK/tp.nii" -quiet -tensor gd -tensor_window 4,4 \
+	-echo "$E2" -echo "$E3"
+if cmp -s "$WORK/tp_echo-1.nii" "$WORK/t_echo-1.nii"
+then bad "tensor: an in-plane window gave the local window's answer"; else ok "tensor: in-plane window differs from local"; fi
+check "tensor: centre assignment" 0 "$BIN" "$E1" "$WORK/tc.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_center y
+check "tensor: demeaned" 0 "$BIN" "$E1" "$WORK/td.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_demean y
+check "tensor: mode order" 0 "$BIN" "$E1" "$WORK/to.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_order time,space,echo
+check "tensor: echo on another grid"   1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-shift-2.nii"
+check "tensor: echo with another TR"   1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-tr-2.nii"
+check "tensor: echo with fewer volumes" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-short-2.nii"
+check "tensor: negative values"        1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-neg-2.nii"
+check "tensor: one echo"               1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN
+check "-echo without -tensor"          1 "$BIN" "$E1" "$WORK/x.nii" -quiet -echo "$E2"
+check "tensor: matrix option refused"  1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -filter truncate
+check "tensor: window too large"       1 "$BIN" "$E1" "$WORK/x.nii" -quiet -tensor gd -echo "$E2" -tensor_window 17,3,3
+check "tensor: one-element window"     1 "$BIN" "$E1" "$WORK/x.nii" -quiet -tensor gd -echo "$E2" -tensor_window 3
+check "tensor: bad mode order"         1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_order space,time,time
+check "tensor: stride list length"     1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_stride 1,2
+check "tensor: negative sigma2"        1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_sigma2 -1
+# No Marchenko-Pastur fit is shipped, under any name.
+check "tensor: mppca is not a method"  1 "$BIN" "$E1" "$WORK/x.nii" -quiet -tensor mppca -echo "$E2"
+# The median estimator needs 3 noise columns; 2 volumes must be refused, not run.
+"$GEN" mk mag-pair "$WORK/pair-e1.nii" && "$GEN" mk mag-pair "$WORK/pair-e2.nii"
+check "tensor: 2 volumes cannot give a noise level" 1 "$BIN" "$WORK/pair-e1.nii" "$WORK/x.nii" -quiet \
+	-tensor gd -echo "$WORK/pair-e2.nii" -tensor_window 3,3,3
+check "tensor: ... but run with a known variance" 0 "$BIN" "$WORK/pair-e1.nii" "$WORK/tpair.nii" -quiet \
+	-tensor gd -echo "$WORK/pair-e2.nii" -tensor_window 3,3,3 -tensor_sigma2 100
+# A stride the parser accepts but no image can use once overflowed the tile
+# arithmetic.  It must leave corner 0 alone: 1280 - 27 voxels uncovered.
+check "tensor: stride INT32_MAX" 0 "$BIN" "$E1" "$WORK/tbig.nii" -quiet $TEN -echo "$E2" \
+	-tensor_stride 2147483647 -noise "$WORK/tbig_noise.nii"
+check "tensor: ... covers corner 0 only" 0 "$GEN" nan "$WORK/tbig_noise.nii" 1253
+# Echo outputs are DERIVED names, so an input can sit exactly where one lands.
+cp "$E2" "$WORK/c_echo-2.nii"; cp "$E2" "$WORK/c2.keep"
+check_collision "tensor: echo output over an echo input" \
+	"$BIN" "$E1" "$WORK/c.nii" -quiet $TEN -echo "$WORK/c_echo-2.nii"
+if cmp -s "$WORK/c_echo-2.nii" "$WORK/c2.keep"
+then ok "tensor: the echo input survived"; else bad "tensor: an echo input was overwritten"; fi
+check_collision "tensor: -noise over an echo output" \
+	"$BIN" "$E1" "$WORK/c.nii" -quiet $TEN -echo "$E2" -noise "$WORK/c_echo-1.nii"
+# Echo 2 as a .hdr/.img pair, under the very name an extensionless output
+# derives for it.  Outputs take echo 1's type, so echo 2's goes to m_echo-2.nii
+# and the pair survives.  Each echo once kept its own type: the output was
+# checked as m_echo-2.nii but written as the pair, over the input, at exit 0.
+"$GEN" mk me-2@ "$WORK/m_echo-2" || { echo "fixture me-2@ failed"; exit 1; }
+cp "$WORK/m_echo-2.img" "$WORK/m2img.keep"
+check "tensor: echoes of mixed file types" 0 "$BIN" "$E1" "$WORK/m" -quiet $TEN -echo "$WORK/m_echo-2.hdr"
+if cmp -s "$WORK/m_echo-2.img" "$WORK/m2img.keep" && [ -s "$WORK/m_echo-2.nii" ]
+then ok "tensor: a pair-format echo survived, its output written as .nii"
+else bad "tensor: a pair-format echo input was overwritten"; fi
+
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

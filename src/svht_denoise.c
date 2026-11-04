@@ -21,6 +21,7 @@
 #include "dn_phase.h"
 #include "dn_run.h"
 #include "dn_sigma.h"
+#include "dn_tensor.h"
 #include "dn_vst.h"
 #ifdef DN_DEGIBBS
 #include "mrdegibbs/dg.h"
@@ -166,6 +167,50 @@ static void usage(void) {
 	printf("                    phase-encode direction, and 6/8 needs an even y dimension.\n");
 	printf("                    1.0 is accepted and means full k-space, the default.\n");
 #endif
+	printf("\n");
+	printf("TENSOR MODE (multi-echo)\n");
+	printf("  svht_denoise <echo1> <output> -tensor gd -echo <echo2> [-echo ...] [options]\n");
+	printf("\n");
+	printf("  Each patch is a space x time x echo TENSOR, denoised mode by mode in the\n");
+	printf("  recursive scheme of Olesen et al. (Magn Reson Med 2022): each unfolding is\n");
+	printf("  cut at the edge of its noise bulk, where the Frobenius-optimal shrinker\n");
+	printf("  reaches zero, and the last mode's kept values are shrunk.  The noise level\n");
+	printf("  comes from the same Gavish & Donoho median-estimator map the matrix\n");
+	printf("  denoiser reads, estimated per echo and pooled as a variance; no\n");
+	printf("  Marchenko-Pastur fit is used.  Windows sit wherever they fit inside the\n");
+	printf("  image, overlapping estimates are averaged uniformly, and a voxel no window\n");
+	printf("  covers keeps its input value and reads NaN in every map.\n");
+	printf("  Echoes are 4D MAGNITUDE series on one grid with one TR, at least 3 volumes;\n");
+	printf("  negative values are refused.  Echo k is written to <output> with\n");
+	printf("  \"_echo-<k>\" before its extension: out.nii.gz -> out_echo-1.nii.gz, ...\n");
+	printf("  -tensor gd            select tensor mode; the only tensor method\n");
+	printf("  -echo <image>         the next echo, in echo order; repeat for each\n");
+	printf("  -tensor_window <w>    x,y,z for a local window (default 5,5,5), or x,y for\n");
+	printf("                        an in-plane window spanning every slice\n");
+	printf("  -tensor_stride <s>    window step: one value, or one per window size\n");
+	printf("                        (default 1).  A step that misses the far edge leaves\n");
+	printf("                        voxels no window covers.\n");
+	printf("  -tensor_order <o>     order the modes are denoised in (default\n");
+	printf("                        space,time,echo); shrinkage applies to the last\n");
+	printf("  -tensor_sigma2 <v>    known noise VARIANCE everywhere, instead of the map\n");
+	printf("  -tensor_shrink <y/n>  shrink the last mode's kept values (default y)\n");
+	printf("  -tensor_demean <y/n>  centre each unfolding along its longer side (default n)\n");
+	printf("  -tensor_center <y/n>  write only each window's centre voxel (its centre\n");
+	printf("                        column for an x,y window) instead of averaging\n");
+	printf("                        (default n).  With -mask, a window whose centre is\n");
+	printf("                        outside the mask is skipped, as in ME-PCA.\n");
+	printf("  -mask <image>         denoise only windows that touch the mask.  Unlike\n");
+	printf("                        matrix mode, such a window writes every voxel it\n");
+	printf("                        covers, and voxels outside the mask are not zeroed.\n");
+	printf("  -noise <image>        noise standard deviation: the square root of the mean\n");
+	printf("                        window variance (float32, NaN where uncovered)\n");
+	printf("  -rank <image>         mean kept rank per mode, one volume per mode in\n");
+	printf("                        -tensor_order (float32; the header names them)\n");
+	printf("  -snr_gain <image>     Olesen et al.'s SNR-gain heuristic, from the mean ranks;\n");
+	printf("                        NaN where nothing was kept (float32)\n");
+	printf("  None of the matrix denoiser's options apply, and each is refused.\n");
+	printf("\n");
+	printf("COMMON OPTIONS\n");
 	printf("  -nthreads <n>     worker threads (default: all cores). -p is an alias.\n");
 	printf("  -quiet            suppress the run summary on stderr\n");
 	printf("  -version, --version   print the version and exit\n");
@@ -444,6 +489,402 @@ static int parse_choice(const char *flag, const char *v, const char *const *name
 	return 1;
 }
 
+// The header's voxel spacing, or isotropic where it cannot vouch for one:
+// non-positive, non-finite, or axes more than 1000x apart, which no acquisition
+// has and which would size the sphere's neighbour box from a nonsense ratio.
+static void header_spacing(const dn_image *img, double sp[3]) {
+	sp[0] = img->nim->dx;
+	sp[1] = img->nim->dy;
+	sp[2] = img->nim->dz;
+	int sp_ok = 1;
+	for (int a = 0; a < 3; a++)
+		if (!(sp[a] > 0.0) || !isfinite(sp[a])) sp_ok = 0;
+	if (sp_ok && fmax(fmax(sp[0], sp[1]), sp[2]) > 1000.0 * fmin(fmin(sp[0], sp[1]), sp[2])) {
+		dn_err("note: voxel spacing %g x %g x %g is implausible; treating it as isotropic\n",
+		       sp[0], sp[1], sp[2]);
+		sp_ok = 0;
+	}
+	if (!sp_ok) sp[0] = sp[1] = sp[2] = 1.0;
+}
+
+// Largest noise-map patch size k for this image: a cube must fit the image; a
+// sphere need not, but its voxels must, and half the image leaves room for the
+// whole-shell overshoot.  dn_sigma_extent never goes below the main patch.
+static int sigma_cap(const dn_image *img, int shape) {
+	int cap = img->nx < img->ny ? img->nx : img->ny;
+	if (img->nz < cap) cap = img->nz;
+	if (shape == DN_SHAPE_SPHERE)
+		for (cap = 3; (double)(cap + 2) * (cap + 2) * (cap + 2) <= 0.5 * (double)img->nvox3d; cap += 2) ;
+	return cap;
+}
+
+// ---------------------------------------------------------------------------
+// Tensor mode (-tensor gd)
+// ---------------------------------------------------------------------------
+
+#define DN_TENSOR_MAX_ECHO 32
+
+typedef struct {
+	const char *method;                          // NULL: matrix mode
+	const char *fin, *fout, *fmask, *fnoise, *frank, *fgain;
+	const char *echoes[DN_TENSOR_MAX_ECHO - 1];  // echoes 2.., in order
+	int nechos;
+	const char *window, *stride, *order;         // as typed, or NULL for the default
+	int shrink, demean, center, known;
+	double sigma2;
+	int nthreads, quiet;
+	int given;   // tensor-only options seen, so matrix mode can refuse them
+} tensor_cli;
+
+// "a,b" or "a,b,c": positive integers, into v.  Returns the count, or 0 if malformed.
+static int parse_list(const char *s, int *v, int maxn) {
+	int n = 0;
+	const char *p = s;
+	for (;;) {
+		char *end = NULL;
+		const long x = strtol(p, &end, 10);
+		if (end == p || x < 1 || x > INT32_MAX || n == maxn) return 0;
+		v[n++] = (int)x;
+		if (*end == '\0') return n;
+		if (*end != ',') return 0;
+		p = end + 1;
+	}
+}
+
+// Echo k's output, "<stem>_echo-<k><ext>", where ext is whichever of .nii.gz,
+// .nii, .hdr or .img the output name ends in (any case), or nothing -- nifti
+// then appends what the input's type implies, as for any extensionless output.
+static char *echo_name(const char *out, int k) {
+	static const char *const exts[] = {".nii.gz", ".nii", ".hdr", ".img", NULL};
+	const size_t len = strlen(out);
+	size_t stem = len;
+	for (int i = 0; exts[i]; i++) {
+		const size_t el = strlen(exts[i]);
+		if (len <= el) continue;
+		int match = 1;
+		for (size_t j = 0; j < el && match; j++) {
+			char c = out[len - el + j];
+			if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+			match = c == exts[i][j];
+		}
+		if (match) { stem = len - el; break; }
+	}
+	const size_t sz = len + 32;
+	char *name = (char *)dn_malloc(sz, 1);
+	if (name) snprintf(name, sz, "%.*s_echo-%d%s", (int)stem, out, k, out + stem);
+	return name;
+}
+
+static int cmp_float_asc(const void *pa, const void *pb) {
+	const float a = *(const float *)pa, b = *(const float *)pb;
+	return (a > b) - (a < b);
+}
+
+// The noise VARIANCE map tensor mode reads: matrix mode's Gavish & Donoho
+// median-estimator map (dn_sigma_map: large spheres on every 4th voxel,
+// smoothed and interpolated), built from each echo's own series and averaged
+// across echoes as a variance.
+//
+// Per echo, not from the echoes concatenated: a long run times its echoes
+// passes DN_MAX_VOL, and the estimation patch grows with the column count
+// (k^3 >= 2N), so a concatenation would cost far more for an estimate of the
+// same thing -- thermal noise is the receiver's, and one variance for every
+// echo is what the tensor model assumes in any case.  The per-echo medians go
+// to `med` so the summary can show whether that assumption looks right.
+// *none is set if no echo gave any estimate (noiseless data).  NULL on failure.
+static float *tensor_noise_map(const dn_image *img, int ne, int nthreads, double *med, int *none) {
+	const int nt = img[0].nvol;
+	const size_t nv = img[0].nvox3d;
+	double sp[3];
+	header_spacing(&img[0], sp);
+	dn_geom g1;
+	const int k1 = dn_sigma_extent(nt, dn_auto_extent(nt), sigma_cap(&img[0], DN_SHAPE_SPHERE));
+	if (dn_geom_init(&g1, DN_SHAPE_SPHERE, img[0].nx, img[0].ny, img[0].nz, nt, sp[0], sp[1], sp[2], k1, 0))
+		return NULL;
+	float *var = (float *)dn_calloc(nv, sizeof(float));
+	float *sorted = (float *)dn_malloc(nv, sizeof(float));
+	if (!var || !sorted) { free(var); free(sorted); return NULL; }
+	*none = 1;
+	for (int e = 0; e < ne; e++) {
+		float *map = dn_sigma_map(&g1, img[e].data, nthreads);
+		if (!map) { free(var); free(sorted); return NULL; }
+		const int filled = dn_sigma_fill(map, nv);
+		if (filled < 0) { free(map); free(var); free(sorted); return NULL; }
+		// A noiseless echo leaves its map at zero, and contributes no variance.
+		if (!filled) *none = 0;
+		for (size_t v = 0; v < nv; v++) {
+			var[v] += map[v] * map[v] / (float)ne;
+			sorted[v] = map[v];
+		}
+		qsort(sorted, nv, sizeof(float), cmp_float_asc);
+		med[e] = nv % 2 ? sorted[nv / 2] : 0.5 * ((double)sorted[nv / 2 - 1] + sorted[nv / 2]);
+		free(map);
+	}
+	free(sorted);
+	return var;
+}
+
+static int run_tensor(const tensor_cli *t) {
+	static const char *const mode_names[] = {"space", "time", "echo"};
+	const int ne = t->nechos + 1;
+	int status = EXIT_FAILURE;
+	dn_image img[DN_TENSOR_MAX_ECHO];
+	float *out[DN_TENSOR_MAX_ECHO];
+	char *oname[DN_TENSOR_MAX_ECHO];
+	dn_path *paths = NULL;
+	uint8_t *mask = NULL;
+	float *noise_var = NULL, *sig = NULL, *rank = NULL, *gain = NULL;
+	memset(img, 0, sizeof img);
+	memset(out, 0, sizeof out);
+	memset(oname, 0, sizeof oname);
+
+	if (ne < 2) {
+		dn_err("-tensor gd needs at least two echoes: <input> and one or more -echo.\n");
+		return EXIT_FAILURE;
+	}
+	const char *fin[DN_TENSOR_MAX_ECHO];
+	fin[0] = t->fin;
+	for (int e = 1; e < ne; e++) fin[e] = t->echoes[e - 1];
+	for (int e = 0; e < ne; e++)
+		if (!strcmp(fin[e], "-")) {
+			dn_err("tensor mode reads every echo from a named file, not stdin.\n");
+			return EXIT_FAILURE;
+		}
+
+	dn_trun r;
+	memset(&r, 0, sizeof r);
+	r.k.shrink_last = t->shrink;
+	r.k.subtract_mean = t->demean;
+	r.sigma2 = t->sigma2;
+	r.centre_assign = t->center;
+	r.ne = ne;
+
+	// A two-element window slides over x and y and spans every slice, as
+	// ME-PCA's run_TensorMPPCA does; three elements make it a local 3D window.
+	// The default is local.
+	int win[3] = {5, 5, 5}, nwin = 3;
+	if (t->window && !(nwin = parse_list(t->window, win, 3))) {
+		dn_err("-tensor_window needs 2 or 3 positive integers, comma separated (got '%s')\n", t->window);
+		return EXIT_FAILURE;
+	}
+	if (nwin < 2) {
+		dn_err("-tensor_window needs 2 or 3 sizes: x,y (spanning every slice) or x,y,z.\n");
+		return EXIT_FAILURE;
+	}
+	int str[3] = {1, 1, 1}, nstr = 1;
+	if (t->stride && !(nstr = parse_list(t->stride, str, 3))) {
+		dn_err("-tensor_stride needs positive integers, comma separated (got '%s')\n", t->stride);
+		return EXIT_FAILURE;
+	}
+	if (nstr != 1 && nstr != nwin) {
+		dn_err("-tensor_stride needs one value, or one per -tensor_window size.\n");
+		return EXIT_FAILURE;
+	}
+	if (nstr == 1) str[1] = str[2] = str[0];
+	r.order[0] = DN_TMODE_SPACE;
+	r.order[1] = DN_TMODE_TIME;
+	r.order[2] = DN_TMODE_ECHO;
+	if (t->order) {
+		char buf[64];
+		int seen = 0, n = 0;
+		if (snprintf(buf, sizeof buf, "%s", t->order) >= (int)sizeof buf) n = -1;
+		for (char *tok = n < 0 ? NULL : strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+			int mode = -1;
+			for (int k = 0; k < 3; k++) if (!strcmp(tok, mode_names[k])) mode = k;
+			if (mode < 0 || (seen & (1 << mode)) || n == 3) { n = -1; break; }
+			seen |= 1 << mode;
+			r.order[n++] = mode;
+		}
+		if (n != 3) {
+			dn_err("-tensor_order needs space, time and echo, each once, comma separated (got '%s')\n",
+			       t->order);
+			return EXIT_FAILURE;
+		}
+	}
+
+	for (int e = 0; e < ne; e++) {
+		if (dn_image_read(fin[e], "echo", 1, &img[e])) goto done;
+		if (e == 0) continue;
+		// Every echo must be the same acquisition: dimensions, grid, and time axis.
+		// A same-sized echo on a shifted grid, or with another TR, would otherwise
+		// be stacked into one tensor and denoised as though it were.
+		if (img[e].nx != img[0].nx || img[e].ny != img[0].ny || img[e].nz != img[0].nz ||
+		    img[e].nvol != img[0].nvol) {
+			dn_err("echo '%s' is %dx%dx%d x %d but '%s' is %dx%dx%d x %d\n", fin[e],
+			       img[e].nx, img[e].ny, img[e].nz, img[e].nvol, fin[0],
+			       img[0].nx, img[0].ny, img[0].nz, img[0].nvol);
+			goto done;
+		}
+		const float off = dn_grid_offset_mm(&img[0], &img[e]);
+		if (!(off <= DN_GRID_TOL_MM)) {
+			dn_err("echo '%s' is not on the grid of '%s' (%g mm apart)\n", fin[e], fin[0], off);
+			goto done;
+		}
+		const double dt0 = img[0].nim->dt, dte = img[e].nim->dt;
+		if (img[e].nim->time_units != img[0].nim->time_units ||
+		    !(fabs(dte - dt0) <= 1e-4 * fmax(fabs(dt0), fabs(dte)))) {
+			dn_err("echo '%s' has a different repetition time from '%s' (%g against %g, in\n",
+			       fin[e], fin[0], dte, dt0);
+			dn_err("  its own time units)\n");
+			goto done;
+		}
+	}
+	// Magnitude only: ME-PCA, whose window rules these are, takes abs() of its
+	// input, which silently destroys a signed series; refusing is the safe half.
+	for (int e = 0; e < ne; e++)
+		for (size_t i = 0; i < img[e].nvox3d * (size_t)img[e].nvol; i++)
+			if (img[e].data[i] < 0.0f) {
+				dn_err("echo '%s' has negative values; tensor mode expects MAGNITUDE images.\n", fin[e]);
+				goto done;
+			}
+
+	r.nx = img[0].nx;
+	r.ny = img[0].ny;
+	r.nz = img[0].nz;
+	r.nt = img[0].nvol;
+	r.win[0] = win[0];
+	r.win[1] = win[1];
+	r.stride[0] = str[0];
+	r.stride[1] = str[1];
+	if (nwin == 2) {
+		r.full_z = 1;
+		r.win[2] = r.nz;
+		r.stride[2] = 1;
+	} else {
+		r.win[2] = win[2];
+		r.stride[2] = str[2];
+	}
+	if (dn_tensor_setup(&r)) goto done;
+
+	for (int e = 0; e < ne; e++)
+		if (!(oname[e] = echo_name(t->fout, e + 1))) goto done;
+	const int npath = 2 * ne + 4;
+	paths = (dn_path *)dn_calloc((size_t)npath, sizeof(dn_path));
+	if (!paths) goto done;
+	for (int e = 0; e < ne; e++) {
+		paths[e] = (dn_path){"echo", fin[e], 1, NULL, NULL};
+		paths[ne + e] = (dn_path){"echo output", oname[e], 0, NULL, NULL};
+	}
+	paths[2 * ne] = (dn_path){"-mask", t->fmask, 1, NULL, NULL};
+	paths[2 * ne + 1] = (dn_path){"-noise", t->fnoise, 0, NULL, NULL};
+	paths[2 * ne + 2] = (dn_path){"-rank", t->frank, 0, NULL, NULL};
+	paths[2 * ne + 3] = (dn_path){"-snr_gain", t->fgain, 0, NULL, NULL};
+	// Every output is written in echo 1's file type, because that is the one
+	// type the check below resolves extensionless names with.  Each echo is
+	// written from its OWN header, and left to its own type an Analyze-pair echo
+	// turned "out_echo-2" into out_echo-2.hdr/.img while the check modelled
+	// out_echo-2.nii -- so an output could land on that echo's input at exit 0.
+	for (int e = 1; e < ne; e++) img[e].nifti_type = img[0].nifti_type;
+	if (check_path_collisions(paths, npath, img[0].nifti_type)) goto done;
+
+	size_t n_in_mask = img[0].nvox3d;
+	if (t->fmask && !(mask = dn_mask_build(&img[0], t->fmask, &n_in_mask))) goto done;
+
+	const int nthreads_req = t->nthreads < 1 ? dn_default_threads() : t->nthreads;
+	double med[DN_TENSOR_MAX_ECHO];
+	int noiseless = 0;
+	if (!t->known) {
+		// The median estimator needs a noise bulk: with fewer than 3 columns its
+		// "median" averages signal and noise (see the matrix mode's fallback).
+		if (r.nt < 3) {
+			dn_err("estimating the noise level needs at least 3 volumes per echo (got %d);\n", r.nt);
+			dn_err("  give it with -tensor_sigma2 instead.\n");
+			goto done;
+		}
+		// Not masked: the map's patches read the whole image, as in matrix mode.
+		if (!(noise_var = tensor_noise_map(img, ne, nthreads_req, med, &noiseless))) goto done;
+		if (noiseless) {
+			dn_err("note: no noise level could be estimated, so every component is kept\n");
+			free(noise_var);
+			noise_var = NULL;
+			r.sigma2 = 0.0;
+		}
+		r.noise_var = noise_var;
+	}
+
+	const int nthreads = dn_tensor_threads(&r, nthreads_req);
+	r.nthreads = nthreads;
+	if (!t->quiet) {
+		dn_err("input        : %d echoes, %dx%dx%d, %d volumes\n", ne, r.nx, r.ny, r.nz, r.nt);
+		for (int e = 0; e < ne; e++) dn_err("  echo %-2d     : %s\n", e + 1, fin[e]);
+		dn_err("method       : tensor, recursive mode-wise cut (Olesen et al. 2022 scheme)\n");
+		if (r.full_z)
+			dn_err("window       : %dx%d in-plane, spanning all %d slices = %d voxels\n",
+			       r.win[0], r.win[1], r.nz, r.win[0] * r.win[1] * r.win[2]);
+		else
+			dn_err("window       : %dx%dx%d = %d voxels\n",
+			       r.win[0], r.win[1], r.win[2], r.win[0] * r.win[1] * r.win[2]);
+		dn_err("tensor       : %s %d x %s %d x %s %d\n", mode_names[r.order[0]], r.k.dims[0],
+		       mode_names[r.order[1]], r.k.dims[1], mode_names[r.order[2]], r.k.dims[2]);
+		if (t->known) dn_err("noise        : known, variance %g\n", t->sigma2);
+		else if (!noiseless) {
+			dn_err("noise        : Gavish-Donoho median map per echo, pooled as a variance;\n");
+			dn_err("  median sigma by echo:");
+			for (int e = 0; e < ne; e++) fprintf(stderr, " %.4g", med[e]);
+			fprintf(stderr, "\n");
+		}
+		dn_err("shrinkage    : %s\n", t->shrink ? "Frobenius-optimal on the last mode" : "none");
+		if (t->demean) dn_err("demean       : every unfolding, along its longer side\n");
+		dn_err("aggregation  : %s, stride %d,%d,%d\n",
+		       t->center ? "window centre only" : "uniform mean of every window", r.stride[0], r.stride[1],
+		       r.stride[2]);
+		dn_err("threads      : %d\n", nthreads);
+		if (mask) dn_err("mask         : %s (%zu of %zu voxels)\n", t->fmask, n_in_mask, img[0].nvox3d);
+	}
+
+	const size_t nv = img[0].nvox3d, nel = nv * (size_t)r.nt;
+	const float *echo_in[DN_TENSOR_MAX_ECHO];
+	for (int e = 0; e < ne; e++) {
+		if (!(out[e] = (float *)dn_calloc(nel, sizeof(float)))) goto done;
+		echo_in[e] = img[e].data;
+	}
+	if (t->fnoise && !(sig = (float *)dn_malloc(nv, sizeof(float)))) goto done;
+	if (t->frank && !(rank = (float *)dn_malloc(nv * 3, sizeof(float)))) goto done;
+	if (t->fgain && !(gain = (float *)dn_malloc(nv, sizeof(float)))) goto done;
+	r.echo = echo_in;
+	r.out = out;
+	r.mask = mask;
+	r.sigma2_out = sig;
+	r.rank = rank;
+	r.gain = gain;
+	if (dn_tensor_execute(&r)) goto done;
+
+	// Maps first, as in matrix mode.  -noise is the standard deviation, the unit
+	// matrix mode writes too: the square root of the mean window variance.
+	if (sig) {
+		for (size_t v = 0; v < nv; v++) sig[v] = sqrtf(sig[v]);
+		if (dn_write_f32(&img[0], t->fnoise, sig, 1)) goto done;
+	}
+	if (rank) {
+		// One volume per tensor mode, in mode order, and the header says which.
+		char saved[80];
+		memcpy(saved, img[0].nim->descrip, sizeof saved);
+		snprintf(img[0].nim->descrip, sizeof saved, "tensor ranks: %s,%s,%s",
+		         mode_names[r.order[0]], mode_names[r.order[1]], mode_names[r.order[2]]);
+		const int rc = dn_write_f32(&img[0], t->frank, rank, 3);
+		memcpy(img[0].nim->descrip, saved, sizeof saved);
+		if (rc) goto done;
+	}
+	if (gain && dn_write_f32(&img[0], t->fgain, gain, 1)) goto done;
+	for (int e = 0; e < ne; e++)
+		if (dn_write_f32(&img[e], oname[e], out[e], r.nt)) goto done;
+	status = EXIT_SUCCESS;
+
+done:
+	for (int e = 0; e < ne; e++) {
+		dn_image_free(&img[e]);
+		free(out[e]);
+		free(oname[e]);
+	}
+	free(paths);
+	free(mask);
+	free(noise_var);
+	free(sig);
+	free(rank);
+	free(gain);
+	return status;
+}
+
 int main(int argc, char *argv[]) {
 	const char *fin = NULL, *fout = NULL;
 	const char *fmask = NULL, *fnoise = NULL, *frank = NULL;
@@ -486,6 +927,11 @@ int main(int argc, char *argv[]) {
 	double pf = DG_PF_FULL;   // symmetric k-space
 	int pf_given = 0;
 #endif
+	// Tensor mode's own options, kept apart from the matrix denoiser's so that
+	// neither mode can silently read the other's.
+	tensor_cli tc;
+	memset(&tc, 0, sizeof tc);
+	tc.shrink = 1;
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
@@ -548,6 +994,42 @@ int main(int argc, char *argv[]) {
 					return EXIT_FAILURE;
 				}
 				denoise_opts++;
+			}
+			else if (!strcmp(a, "-tensor")) {
+				if (strcmp(v, "gd")) {
+					dn_err("-tensor must be gd, the only tensor method (got '%s')\n", v);
+					return EXIT_FAILURE;
+				}
+				tc.method = v;
+			}
+			else if (!strcmp(a, "-echo")) {
+				if (tc.nechos >= DN_TENSOR_MAX_ECHO - 1) {
+					dn_err("at most %d echoes\n", DN_TENSOR_MAX_ECHO);
+					return EXIT_FAILURE;
+				}
+				tc.echoes[tc.nechos++] = v;
+				tc.given++;
+			}
+			else if (!strcmp(a, "-snr_gain")) { tc.fgain = v; tc.given++; }
+			else if (!strcmp(a, "-tensor_window")) { tc.window = v; tc.given++; }
+			else if (!strcmp(a, "-tensor_stride")) { tc.stride = v; tc.given++; }
+			else if (!strcmp(a, "-tensor_order")) { tc.order = v; tc.given++; }
+			else if (!strcmp(a, "-tensor_shrink") || !strcmp(a, "-tensor_demean") ||
+			         !strcmp(a, "-tensor_center")) {
+				int *dst = !strcmp(a, "-tensor_shrink") ? &tc.shrink
+				         : !strcmp(a, "-tensor_demean") ? &tc.demean : &tc.center;
+				if (parse_choice(a, v, yes_no, dst)) return EXIT_FAILURE;
+				tc.given++;
+			}
+			else if (!strcmp(a, "-tensor_sigma2")) {
+				char *pend = NULL;
+				tc.sigma2 = strtod(v, &pend);
+				if (*pend != '\0' || pend == v || !(tc.sigma2 >= 0.0) || !isfinite(tc.sigma2)) {
+					dn_err("-tensor_sigma2 needs a finite, non-negative noise VARIANCE (got '%s')\n", v);
+					return EXIT_FAILURE;
+				}
+				tc.known = 1;
+				tc.given++;
 			}
 			else if (!strcmp(a, "-phaseunits")) {
 				punits_given = 1;
@@ -633,13 +1115,42 @@ int main(int argc, char *argv[]) {
 	// writes an image to stdout, and the collision check models it as the file
 	// "-.nii" -- so the checker and the writer disagreed about where it goes.
 	// Undocumented either way; rejecting keeps the invariant true.
-	const char *sv_out[4] = {fout, fnoise, frank, freal};
-	const char *sv_lbl[4] = {"output", "-noise", "-rank", "-real"};
-	for (int i = 0; i < 4; i++) {
+	const char *sv_out[5] = {fout, fnoise, frank, freal, tc.fgain};
+	const char *sv_lbl[5] = {"output", "-noise", "-rank", "-real", "-snr_gain"};
+	for (int i = 0; i < 5; i++) {
 		if (sv_out[i] && sv_out[i][0] == '-' && sv_out[i][1] == '\0') {
 			dn_err("\"-\" is an input (stdin), not an output; %s needs a filename.\n", sv_lbl[i]);
 			return EXIT_FAILURE;
 		}
+	}
+	// Tensor mode is a different estimator with its own options, so each mode
+	// refuses the other's rather than quietly ignoring them.
+	if (!tc.method && tc.given) {
+		dn_err("-echo, -snr_gain and the -tensor_* options describe tensor denoising,\n");
+		dn_err("  which needs -tensor gd.\n");
+		return EXIT_FAILURE;
+	}
+	if (tc.method) {
+		int matrix_opts = denoise_opts + (fphase != NULL) + (freal != NULL) + extent_given +
+		                  punits_given + (degibbs != DN_DG_NO);
+#ifdef DN_DEGIBBS
+		matrix_opts += pf_given;
+#endif
+		if (matrix_opts) {
+			dn_err("-tensor gd takes none of the matrix denoiser's options (-phase, -real,\n");
+			dn_err("  -phaseunits, -bval, -demean, -filter, -shape, -aggregator(_fwhm), -stride,\n");
+			dn_err("  -vst, -noise_dof, -preserve_noise_bias, -extent, -degibbs, -pF); its own\n");
+			dn_err("  are the -tensor_* options.\n");
+			return EXIT_FAILURE;
+		}
+		tc.fin = fin;
+		tc.fout = fout;
+		tc.fmask = fmask;
+		tc.fnoise = fnoise;
+		tc.frank = frank;
+		tc.nthreads = nthreads;
+		tc.quiet = quiet;
+		return run_tensor(&tc);
 	}
 	// -degibbs o does no denoising, so everything describing the denoiser -- its
 	// mask, its by-products, its patch size, and the phase rotation that exists
@@ -826,30 +1337,12 @@ int main(int argc, char *argv[]) {
 	}
 
 	dn_geom g, g1;
-	// A spacing the header cannot vouch for is taken as isotropic: non-positive,
-	// non-finite, or axes more than 1000x apart, which no acquisition has and which
-	// would size the sphere's neighbour box from a nonsense ratio.
-	double sp[3] = {img.nim->dx, img.nim->dy, img.nim->dz};
-	int sp_ok = 1;
-	for (int a = 0; a < 3; a++)
-		if (!(sp[a] > 0.0) || !isfinite(sp[a])) sp_ok = 0;
-	if (sp_ok && fmax(fmax(sp[0], sp[1]), sp[2]) > 1000.0 * fmin(fmin(sp[0], sp[1]), sp[2])) {
-		dn_err("note: voxel spacing %g x %g x %g is implausible; treating it as isotropic\n",
-		       sp[0], sp[1], sp[2]);
-		sp_ok = 0;
-	}
-	if (!sp_ok) sp[0] = sp[1] = sp[2] = 1.0;
+	double sp[3];
+	header_spacing(&img, sp);
 	if (dn_geom_init(&g, shape, img.nx, img.ny, img.nz, img.nvol, sp[0], sp[1], sp[2], extent, ngroups))
 		goto done;
 	if (need_map) {
-		// A cube must fit the image; a sphere need not.
-		int cap = img.nx < img.ny ? img.nx : img.ny;
-		if (img.nz < cap) cap = img.nz;
-		// A sphere need not fit inside the image, but its voxels must: half the image
-		// leaves room for the whole-shell overshoot.  Never below the main patch.
-		if (shape == DN_SHAPE_SPHERE)
-			for (cap = 3; (double)(cap + 2) * (cap + 2) * (cap + 2) <= 0.5 * (double)img.nvox3d; cap += 2) ;
-		const int k1 = dn_sigma_extent(img.nvol, extent, cap);
+		const int k1 = dn_sigma_extent(img.nvol, extent, sigma_cap(&img, shape));
 		if (dn_geom_init(&g1, shape, img.nx, img.ny, img.nz, img.nvol, sp[0], sp[1], sp[2], k1, ngroups))
 			goto done;
 	}
