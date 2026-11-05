@@ -51,7 +51,7 @@ struct dn_tensor_work {
 	dn_tensor_opts o;
 	size_t n;              // elements in the patch
 	int gmax;              // largest Gram any unfolding can need
-	double *a, *t;         // n each: a centred copy; a transpose
+	double *a, *t;         // n each: a centered copy; a transpose
 	double *b[2];          // n each: the forward chain, alternately
 	double *gram, *evecs;  // gmax^2
 	double *evals, *f;     // gmax
@@ -287,7 +287,7 @@ static int factors(dn_tensor_work *w, dn_eig *e, const double *A, int m, size_t 
 	return 0;
 }
 
-// The matrix level k decomposes: X itself, or X centred along its longer side
+// The matrix level k decomposes: X itself, or X centered along its longer side
 // into w->a, with the means kept for the reverse pass.
 static const double *prepare(dn_tensor_work *w, const double *X, int m, size_t c, int k) {
 	if (!w->o.subtract_mean) {
@@ -349,7 +349,7 @@ int dn_tensor_denoise(const dn_tensor_opts *o, dn_tensor_work *w, double *x,
 		const int r = retained(w->evals, g, sigma2 * (root * root));
 		const double *f = NULL;
 		if (lev == K - 1 && o->shrink_last && r > 0) {
-			// Gavish & Donoho 2017's Frobenius-optimal shrinkage, in unnormalised
+			// Gavish & Donoho 2017's Frobenius-optimal shrinkage, in unnormalized
 			// units, against the residual sizes left once r are kept.
 			const double rows = fmax((double)(m - r), 1.0), cols = fmax((double)c - r, 1.0);
 			for (int k = 0; k < r; k++) {

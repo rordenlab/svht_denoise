@@ -12,6 +12,8 @@
 //   dn_testgen rms <file.nii> <want> <reltol>  exit 0 if the RMS still matches
 //   dn_testgen neg <file.nii>                  exit 0 if any value is negative
 //   dn_testgen nan <file.nii> <count>          exit 0 if exactly <count> values are NaN
+//   dn_testgen volrms <f> <vol> <want> <tol>   exit 0 if volume <vol>'s RMS still matches
+//   dn_testgen cmpnan <a> <b> <map> <tol>      exit 0 if a == b (relative) where map is NaN
 //
 // Fixtures are 9x9x3 x 8 volumes and deterministic, except:
 //   mask            a single volume          mask-wrongdim  7x9x3 x 1
@@ -331,6 +333,44 @@ int main(int argc, char **argv) {
 		printf("%d\n", nnan);
 		return nnan == atoi(argv[3]) ? 0 : 1;
 	}
+	// RMS of volume <vol> (0-based) alone: a per-echo noise map is one volume
+	// per echo, and the whole-file RMS would blend the echoes it must keep apart.
+	if (argc == 6 && !strcmp(argv[1], "volrms")) {
+		nhdr1 h;
+		FILE *f = fopen(argv[2], "rb");
+		if (!f || fread(&h, sizeof h, 1, f) != 1) { if (f) fclose(f); return 2; }
+		fclose(f);
+		const int nt = h.dim[0] >= 4 && h.dim[4] > 0 ? h.dim[4] : 1, vol = atoi(argv[3]);
+		int n = 0;
+		float *a = read_nii(argv[2], &n);
+		if (!a || n % nt || vol < 0 || vol >= nt) { free(a); return 2; }
+		const int n3 = n / nt;
+		double s = 0.0;
+		for (int i = 0; i < n3; i++) s += (double)a[(size_t)vol * n3 + i] * a[(size_t)vol * n3 + i];
+		free(a);
+		const double rms = sqrt(s / n3), want = atof(argv[4]);
+		printf("%.9g\n", rms);
+		return (want != 0.0 && fabs(rms - want) / fabs(want) <= atof(argv[5])) ? 0 : 1;
+	}
+	// a == b, relative to |b|, wherever the 3D <map> is NaN: tensor mode's
+	// uncovered voxels, which must keep their input value through the noise
+	// normalization and back.  Prints the count and the worst relative difference.
+	if (argc == 6 && !strcmp(argv[1], "cmpnan")) {
+		int na = 0, nb = 0, nm = 0;
+		float *a = read_nii(argv[2], &na), *b = read_nii(argv[3], &nb), *mk = read_nii(argv[4], &nm);
+		if (!a || !b || !mk || na != nb || nm <= 0 || na % nm) { free(a); free(b); free(mk); return 2; }
+		int count = 0;
+		double worst = 0.0;
+		for (int i = 0; i < na; i++) {
+			if (!isnan(mk[i % nm])) continue;
+			count++;
+			const double d = fabs((double)a[i] - b[i]) / fmax(fabs((double)b[i]), 1.0);
+			if (d > worst) worst = d;
+		}
+		free(a); free(b); free(mk);
+		printf("%d uncovered samples, worst relative difference %.3g\n", count, worst);
+		return count > 0 && worst <= atof(argv[5]) ? 0 : 1;
+	}
 	if (argc == 3 && !strcmp(argv[1], "neg")) {
 		int n = 0;
 		float *a = read_nii(argv[2], &n);
@@ -350,7 +390,9 @@ int main(int argc, char **argv) {
 		                "       dn_testgen nozero <file.nii>\n"
 		                "       dn_testgen rms  <file.nii> <expected> <reltol>\n"
 		                "       dn_testgen neg  <file.nii>\n"
-		                "       dn_testgen nan  <file.nii> <count>\n");
+		                "       dn_testgen nan  <file.nii> <count>\n"
+		                "       dn_testgen volrms <file.nii> <vol> <expected> <reltol>\n"
+		                "       dn_testgen cmpnan <a.nii> <b.nii> <map.nii> <reltol>\n");
 		return 2;
 	}
 
@@ -623,9 +665,15 @@ int main(int argc, char **argv) {
 		//   me-tr-<k>       echo k with a TR of 2 instead of 1
 		//   me-short-<k>    echo k with 11 volumes
 		//   me-neg-<k>      echo k with one negative sample
+		//   me-cmag-<k>, me-cphase-<k>  echo k as COMPLEX data: the same signal under a
+		//                   smooth phase that grows with TE and drifts in time, plus
+		//                   complex Gaussian noise of SD 20 per component; magnitude,
+		//                   and phase in radians
+		//   me-hetero-<k>   echo k with noise SD 40, 20, 10 for k = 1, 2, 3, as echoes
+		//                   reconstructed with echo-specific parallel imaging can have
 		//   me-mask         a 3D mask, a slab in the middle with a hole
 		const int enx = 16, eny = 16, enz = 5, en3 = enx * eny * enz;
-		int ent = 12, echo = 0, clean = 0, neg = 0;
+		int ent = 12, echo = 0, clean = 0, neg = 0, cplx = 0, hetero = 0;
 		const char *num = kind + 3;
 		if (!strcmp(num, "mask")) {
 			float *b = (float *)malloc((size_t)en3 * sizeof(float));
@@ -646,6 +694,9 @@ int main(int argc, char **argv) {
 		else if (!strncmp(num, "tr-", 3)) { vox_tr = 2.0; num += 3; }
 		else if (!strncmp(num, "short-", 6)) { ent = 11; num += 6; }
 		else if (!strncmp(num, "neg-", 4)) { neg = 1; num += 4; }
+		else if (!strncmp(num, "cmag-", 5)) { cplx = 1; num += 5; }
+		else if (!strncmp(num, "cphase-", 7)) { cplx = 2; num += 7; }
+		else if (!strncmp(num, "hetero-", 7)) { hetero = 1; num += 7; }
 		echo = atoi(num);
 		if (echo < 1 || echo > 3) {
 			fprintf(stderr, "unknown fixture kind '%s'\n", kind);
@@ -653,6 +704,7 @@ int main(int argc, char **argv) {
 			return 2;
 		}
 		const double te = 15.0 + 20.0 * (echo - 1);
+		const double sd = hetero ? 40.0 / (1 << (echo - 1)) : 20.0;
 		float *b = (float *)malloc((size_t)en3 * ent * sizeof(float));
 		if (!b) { free(d); return 2; }
 		for (int t2 = 0; t2 < ent; t2++)
@@ -664,7 +716,14 @@ int main(int argc, char **argv) {
 				const uint32_t i = (uint32_t)((echo * ent + t2) * en3 + v) * 2u;
 				const double g = sqrt(-2.0 * log(1.0 - rng(i))) * cos(2.0 * M_PI * rng(i + 1));
 				const double s = s0 * bold * exp(-te * r2);
-				b[(size_t)t2 * en3 + v] = (float)(clean ? s : fabs(s + 20.0 * g));
+				if (cplx) {
+					const double ph = te * (0.05 * sin(0.3 * x + 0.2 * y) + 0.01 * z) + 0.2 * sin(0.4 * t2);
+					const double h = sqrt(-2.0 * log(1.0 - rng(i))) * sin(2.0 * M_PI * rng(i + 1));
+					const double re = s * cos(ph) + 20.0 * g, im = s * sin(ph) + 20.0 * h;
+					b[(size_t)t2 * en3 + v] = (float)(cplx == 1 ? sqrt(re * re + im * im) : atan2(im, re));
+					continue;
+				}
+				b[(size_t)t2 * en3 + v] = (float)(clean ? s : fabs(s + sd * g));
 			}
 		if (neg) b[17] = -1.0f;
 		rc = as_pair ? write_pair_dim(argv[3], b, enx, eny, enz, ent, vox)

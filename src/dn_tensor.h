@@ -28,7 +28,7 @@ typedef struct {
 	int nmodes;                       // K >= 3; a matrix is not denoised here
 	int dims[DN_TENSOR_MAX_MODES];    // every one >= 2
 	int shrink_last;    // GD 2017 Frobenius shrinkage on the last mode's retained values
-	int subtract_mean;  // centre each unfolding along its longer side first
+	int subtract_mean;  // center each unfolding along its longer side first
 } dn_tensor_opts;
 
 typedef struct dn_tensor_work dn_tensor_work;
@@ -67,11 +67,11 @@ typedef struct {
 	dn_tensor_opts k;   // shrink/mean; nmodes and dims are filled in by dn_tensor_setup
 	int nx, ny, nz, nt, ne;
 	// Window per spatial axis.  A two-element window is win[2] = nz with the
-	// patch spanning every slice; full_z records that, because centre
-	// assignment then writes the centre COLUMN rather than one voxel.
+	// patch spanning every slice; full_z records that, because center
+	// assignment then writes the center COLUMN rather than one voxel.
 	int win[3], stride[3], full_z;
 	int order[3];         // tensor mode k is DN_TMODE_* order[k]
-	int centre_assign;    // write only each window's centre (column)
+	int center_assign;    // write only each window's center (column)
 	const float *const *echo;   // ne inputs, each nvox3d*nt, volume-major
 	float *const *out;          // ne outputs, same layout
 	const uint8_t *mask;        // nvox3d, or NULL: a window is denoised if it touches it

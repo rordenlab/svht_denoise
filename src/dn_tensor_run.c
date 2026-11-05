@@ -12,9 +12,9 @@
 //     no window covered keeps its input value and reads NaN in every map.
 //
 // Determinism, as dn_agg.c: window corners are split into tiles one window wide
-// (rounded up to whole strides) and coloured 2x2x2.  A window reaches w-1
-// voxels past its corner and same-colour tiles start two tiles apart, so they
-// never write the same voxel; colours run in a fixed order and each tile's
+// (rounded up to whole strides) and colored 2x2x2.  A window reaches w-1
+// voxels past its corner and same-color tiles start two tiles apart, so they
+// never write the same voxel; colors run in a fixed order and each tile's
 // windows in raster order, so every voxel receives its contributions in the
 // same order at any thread count.
 
@@ -30,15 +30,15 @@
 typedef struct {
 	const dn_trun *r;
 	pthread_mutex_t lock;
-	const size_t *tiles;   // this colour's tiles
+	const size_t *tiles;   // this color's tiles
 	size_t ntiles, next;
 	int T[3], nt[3], npos[3];
 	size_t st[3];          // patch-tensor stride of DN_TMODE_SPACE, _TIME, _ECHO
 	int m;                 // voxels per window
 	size_t *off;           // m voxel offsets from the window corner, x fastest
-	int *rows;             // window rows a window WRITES: all m, or its centre
+	int *rows;             // window rows a window WRITES: all m, or its center
 	int nrows;
-	int *crow;             // window rows of the centre voxel, or column
+	int *crow;             // window rows of the center voxel, or column
 	int ncrow;
 	uint32_t *count;       // nvox3d: estimates received so far
 	double *sacc, *racc;   // running means of sigma2, and of each mode's rank
@@ -46,7 +46,7 @@ typedef struct {
 	unsigned long eig_fail, fallbacks;
 } tpool;
 
-static int tile_colour(size_t t, const int nt[3]) {
+static int tile_color(size_t t, const int nt[3]) {
 	const size_t tx = t % (size_t)nt[0], ty = (t / (size_t)nt[0]) % (size_t)nt[1];
 	const size_t tz = t / ((size_t)nt[0] * nt[1]);
 	return (int)((tx & 1) | (ty & 1) << 1 | (tz & 1) << 2);
@@ -101,7 +101,7 @@ int dn_tensor_threads(const dn_trun *r, int requested) {
 	int T[3], nt[3], npos[3], count[8] = {0}, maxper = 0;
 	tile_grid(r, T, nt, npos);
 	const size_t ntile = (size_t)nt[0] * nt[1] * nt[2];
-	for (size_t t = 0; t < ntile; t++) count[tile_colour(t, nt)]++;
+	for (size_t t = 0; t < ntile; t++) count[tile_color(t, nt)]++;
 	for (int c = 0; c < 8; c++) if (count[c] > maxper) maxper = count[c];
 	const size_t per = dn_tensor_work_bytes(&r->k) + patch_size(r) * sizeof(double);
 	return dn_cap_threads(requested, (size_t)maxper, per);
@@ -155,7 +155,7 @@ static void *tworker(void *arg) {
 					const size_t base = (size_t)cx + (size_t)nx * ((size_t)cy + (size_t)ny * cz);
 					if (r->mask) {
 						if (!touches(p, base, NULL, p->m)) continue;
-						if (r->centre_assign && !touches(p, base, p->crow, p->ncrow)) continue;
+						if (r->center_assign && !touches(p, base, p->crow, p->ncrow)) continue;
 					}
 					for (int e = 0; e < ne; e++)
 						for (int j = 0; j < nt; j++) {
@@ -232,8 +232,8 @@ int dn_tensor_execute(const dn_trun *r) {
 	}
 
 	// Window rows, x fastest then y then z -- the reference's spatial index.  The
-	// centre is ceil(w/2) - 1 per axis; a two-element window spans every slice,
-	// so its centre is the whole column.
+	// center is ceil(w/2) - 1 per axis; a two-element window spans every slice,
+	// so its center is the whole column.
 	p.m = r->win[0] * r->win[1] * r->win[2];
 	p.off = (size_t *)dn_malloc((size_t)p.m, sizeof(size_t));
 	p.rows = (int *)dn_malloc((size_t)p.m, sizeof(int));
@@ -250,7 +250,7 @@ int dn_tensor_execute(const dn_trun *r) {
 				p.off[i] = (size_t)a + (size_t)nx * ((size_t)b + (size_t)ny * (size_t)c);
 				if (a == ccx && b == ccy && (r->full_z || c == ccz)) p.crow[p.ncrow++] = i;
 			}
-	if (r->centre_assign) {
+	if (r->center_assign) {
 		for (int i = 0; i < p.ncrow; i++) p.rows[i] = p.crow[i];
 		p.nrows = p.ncrow;
 	} else {
@@ -266,10 +266,10 @@ int dn_tensor_execute(const dn_trun *r) {
 		goto done;
 	}
 	const int nthreads = dn_tensor_threads(r, r->nthreads);
-	for (int colour = 0; colour < 8 && !p.failed; colour++) {
+	for (int color = 0; color < 8 && !p.failed; color++) {
 		size_t k = 0;
 		for (size_t t = 0; t < ntile; t++)
-			if (tile_colour(t, p.nt) == colour) tiles[k++] = t;
+			if (tile_color(t, p.nt) == color) tiles[k++] = t;
 		p.tiles = tiles;
 		p.ntiles = k;
 		p.next = 0;

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check svht_denoise's tensor mode against the ME-PCA Python package.
 
-``-tensor gd`` estimates its noise level from the matrix mode's Gavish-Donoho
-median map; ME-PCA estimates it with a Marchenko-Pastur fit, which svht_denoise
-does not implement.  So the two are compared at the same KNOWN noise variance,
+``-tensor gd`` estimates each echo's noise level from the matrix mode's
+Gavish-Donoho median map, and puts each echo in units of it; ME-PCA estimates
+one level with a Marchenko-Pastur fit, which svht_denoise does not implement.  So the two are compared at the same KNOWN noise variance,
 where ME-PCA runs only its recursive pass and its window rules -- exactly what
 svht_denoise shares with it -- and never its noise fit.  Three parts, all on
 data generated here with a fixed seed:
@@ -17,8 +17,8 @@ data generated here with a fixed seed:
    ``mepca.tensor_pca.denoise_recursive_tensor`` on the same float32 values (as
    float64).  Compared: every denoised echo, the noise map, the per-mode rank
    maps and the SNR-gain map, including which voxels are uncovered.
-3. Estimator: svht_denoise's own noise map against the true SD, and its
-   denoising error against the same run at the true variance (no reference).
+3. Estimator: svht_denoise's own per-echo noise maps against the true SD, and
+   its denoising error against the same run at the true variance (no reference).
 
 SVD signs.  With ``subtract_mean`` the result depends on the sign of every
 singular vector (later levels take means across the reshaped V*S), and LAPACK
@@ -271,7 +271,10 @@ def image_case(binary, name, data, window, options, mask, order, tmp):
         out = nb.load(case_dir / f"out_echo-{i_echo + 1}.nii").get_fdata()
         worst = max(worst, rel_l2(out, denoised[..., i_echo]))
 
-    noise = nb.load(case_dir / "noise.nii").get_fdata()
+    # -noise has one volume per echo; at a known variance every one is the same.
+    noise_echoes = nb.load(case_dir / "noise.nii").get_fdata()
+    noise = noise_echoes[..., 0]
+    same_echoes = all(np.array_equal(noise_echoes[..., i], noise, equal_nan=True) for i in range(data.shape[-1]))
     rank = nb.load(case_dir / "rank.nii").get_fdata()
     gain = nb.load(case_dir / "gain.nii").get_fdata()
     ref_noise = np.sqrt(sigma2_map)
@@ -281,7 +284,8 @@ def image_case(binary, name, data, window, options, mask, order, tmp):
     finite_gain = np.isfinite(snr_gain)
     d_gain = rel_l2(gain[finite_gain], snr_gain[finite_gain]) if finite_gain.any() else 0.0
     patterns = (
-        nonfinite_equal(noise, ref_noise)
+        same_echoes
+        and nonfinite_equal(noise, ref_noise)
         and nonfinite_equal(rank, p_map)
         and nonfinite_equal(gain, snr_gain)
     )
@@ -341,8 +345,9 @@ def estimator_case(binary, data, clean, tmp):
             noise = nb.load(case_dir / "noise.nii").get_fdata()
 
     ok = errors["map"] <= 1.05 * errors["oracle"]
+    medians = " ".join(f"{np.median(noise[..., i]):.4g}" for i in range(noise.shape[-1]))
     print(
-        f"  {'ok  ' if ok else 'FAIL'} estimator: noise map median {np.median(noise):.4g} against a "
+        f"  {'ok  ' if ok else 'FAIL'} estimator: per-echo noise map medians {medians} against a "
         f"true SD of {NOISE_SD:g}; error to truth {errors['map']:.4g}, at the true variance "
         f"{errors['oracle']:.4g}, input {rel_l2(data, clean):.4g}"
     )
