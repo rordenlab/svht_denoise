@@ -173,8 +173,8 @@ static void usage(void) {
 	printf("\n");
 	printf("  Each patch is a space x time x echo TENSOR, denoised mode by mode in the\n");
 	printf("  recursive scheme of Olesen et al. (Magn Reson Med 2022): each unfolding is\n");
-	printf("  cut at the edge of its noise bulk, where the Frobenius-optimal shrinker\n");
-	printf("  reaches zero, and the last mode's kept values are shrunk.  The noise level\n");
+	printf("  cut at the edge of its noise bulk and the last mode's kept values are\n");
+	printf("  shrunk, unless -tensor_filter says otherwise.  The noise level\n");
 	printf("  of each echo comes from the same Gavish & Donoho median-estimator map the\n");
 	printf("  matrix denoiser reads, and each echo is put in units of its OWN noise\n");
 	printf("  before the tensor is built (echoes rarely share one), then mapped back; no\n");
@@ -197,6 +197,7 @@ static void usage(void) {
 	printf("                        voxels no window covers.\n");
 	printf("  -tensor_order <o>     order the modes are denoised in (default\n");
 	printf("                        space,time,echo); shrinkage applies to the last\n");
+	printf("                        mode\n");
 	printf("  -tensor_sigma2 <v>    known noise VARIANCE of every echo, instead of the maps\n");
 	printf("  -tensor_noise <n>     echo (default): each echo in units of its OWN noise\n");
 	printf("                        map; or pooled: one map, the mean variance over the\n");
@@ -210,7 +211,15 @@ static void usage(void) {
 	printf("                        matrix mode, rather than only scaling it by the map.\n");
 	printf("                        Default y for magnitude; refused with -tensor_phase\n");
 	printf("                        (already Gaussian) and -tensor_sigma2 (no map).\n");
-	printf("  -tensor_shrink <y/n>  shrink the last mode's kept values (default y)\n");
+	printf("  -tensor_filter <f>    how each mode keeps components: optshrink (default),\n");
+	printf("                        cut at the bulk edge with the last mode's kept values\n");
+	printf("                        shrunk (Gavish & Donoho 2017); truncate, the same cut\n");
+	printf("                        with nothing shrunk; or optthresh, Gavish & Donoho\n");
+	printf("                        2014's KNOWN-noise optimal hard threshold at every\n");
+	printf("                        mode, lambda*(beta) sigma sqrt(n), nothing shrunk.\n");
+	printf("                        All three read the same per-echo noise; matrix\n");
+	printf("                        optthresh's unknown-noise rule needs a median over\n");
+	printf("                        many noise values, which the echo mode lacks.\n");
 	printf("  -tensor_demean <y/n>  center each unfolding along its longer side (default n)\n");
 	printf("  -tensor_center <y/n>  write only each window's center voxel (its center\n");
 	printf("                        column for an x,y window) instead of averaging\n");
@@ -551,7 +560,8 @@ typedef struct {
 	int nphases;
 	dn_phase_units punits;
 	const char *window, *stride, *order;         // as typed, or NULL for the default
-	int shrink, demean, center, known;
+	int filter;  // -tensor_filter: DN_TFILTER_*
+	int demean, center, known;
 	int vst;     // -tensor_vst: 0, 1, or -1 for the default
 	int pooled;  // -tensor_noise pooled: one noise map for every echo
 	double sigma2;
@@ -776,7 +786,7 @@ static int run_tensor(const tensor_cli *t) {
 
 	dn_trun r;
 	memset(&r, 0, sizeof r);
-	r.k.shrink_last = t->shrink;
+	r.k.filter = t->filter;
 	r.k.subtract_mean = t->demean;
 	r.sigma2 = t->sigma2;
 	r.center_assign = t->center;
@@ -979,7 +989,10 @@ static int run_tensor(const tensor_cli *t) {
 			for (int e = 0; e < ne; e++) fprintf(stderr, " %.4g", med[e]);
 			fprintf(stderr, "\n");
 		}
-		dn_err("shrinkage    : %s\n", t->shrink ? "Frobenius-optimal on the last mode" : "none");
+		dn_err("filter       : %s\n",
+		       t->filter == DN_TFILTER_OPTTHRESH ? "optthresh: known-noise optimal hard threshold, every mode"
+		       : t->filter == DN_TFILTER_TRUNCATE ? "truncate: bulk edge, nothing shrunk"
+		       : "optshrink: bulk edge, Frobenius-optimal shrinkage on the last mode");
 		if (t->demean) dn_err("demean       : every unfolding, along its longer side\n");
 		dn_err("aggregation  : %s, stride %d,%d,%d\n",
 		       t->center ? "window center only" : "uniform mean of every window", r.stride[0], r.stride[1],
@@ -1102,7 +1115,6 @@ int main(int argc, char *argv[]) {
 	// neither mode can silently read the other's.
 	tensor_cli tc;
 	memset(&tc, 0, sizeof tc);
-	tc.shrink = 1;
 	tc.vst = -1;
 
 	for (int i = 1; i < argc; i++) {
@@ -1199,10 +1211,14 @@ int main(int argc, char *argv[]) {
 				if (parse_choice(a, v, noise_modes, &tc.pooled)) return EXIT_FAILURE;
 				tc.given++;
 			}
-			else if (!strcmp(a, "-tensor_shrink") || !strcmp(a, "-tensor_demean") ||
-			         !strcmp(a, "-tensor_center") || !strcmp(a, "-tensor_vst")) {
-				int *dst = !strcmp(a, "-tensor_shrink") ? &tc.shrink
-				         : !strcmp(a, "-tensor_demean") ? &tc.demean
+			else if (!strcmp(a, "-tensor_filter")) {
+				static const char *const tfilters[] = {"optshrink", "truncate", "optthresh", NULL};  // DN_TFILTER_*
+				if (parse_choice(a, v, tfilters, &tc.filter)) return EXIT_FAILURE;
+				tc.given++;
+			}
+			else if (!strcmp(a, "-tensor_demean") || !strcmp(a, "-tensor_center") ||
+			         !strcmp(a, "-tensor_vst")) {
+				int *dst = !strcmp(a, "-tensor_demean") ? &tc.demean
 				         : !strcmp(a, "-tensor_vst") ? &tc.vst : &tc.center;
 				if (parse_choice(a, v, yes_no, dst)) return EXIT_FAILURE;
 				tc.given++;

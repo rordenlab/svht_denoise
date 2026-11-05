@@ -307,7 +307,7 @@ $(TESTGEN): dn_testgen.c $(FLAGSTAMP)
 # reconstruction at sigma2 = 0).  Linked against the same objects as the tool,
 # so a sanitizer build instruments it too.
 TENSORTEST = dn_tensortest
-TENSORTEST_OBJS = dn.o dn_eig.o dn_tensor.o
+TENSORTEST_OBJS = dn.o dn_coef.o dn_eig.o dn_lambda_star.o dn_tensor.o
 
 $(TENSORTEST): dn_tensortest.o $(TENSORTEST_OBJS)
 	$(CC) $(ALL_CFLAGS) -o $@ dn_tensortest.o $(TENSORTEST_OBJS) $(LDLIBS)

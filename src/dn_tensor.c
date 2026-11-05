@@ -17,9 +17,11 @@
 // floor for that reason; it can only bind at sigma2 == 0.
 //
 // THE CUT.  Level k keeps the components with s^2 > sigma2*(sqrt(m)+sqrt(c))^2,
-// m x c being THAT level's unfolding -- the edge of the noise bulk, which is
-// also exactly where the Frobenius shrinker the last level applies reaches
-// zero, so every level discards what matrix-mode optshrink would.
+// m x c being THAT level's unfolding -- the edge of the noise bulk, the same
+// edge matrix-mode optshrink and truncate discard below.  Under optthresh it is
+// instead Gavish & Donoho 2014's KNOWN-noise optimal hard threshold,
+// s^2 > sigma2 * lambda_*(beta)^2 * max(m,c) with beta = min(m,c)/max(m,c),
+// which sits above the edge and keeps every survivor whole.
 
 #include <float.h>
 #include <math.h>
@@ -27,6 +29,7 @@
 #include <string.h>
 
 #include "dn.h"
+#include "dn_coef.h"
 #include "dn_eig.h"
 #include "dn_tensor.h"
 
@@ -348,10 +351,19 @@ int dn_tensor_denoise(const dn_tensor_opts *o, dn_tensor_work *w, double *x,
 		int g;
 		dn_eig *e = spectrum(w, A, m, c, &g);
 		if (!e) return 1;
-		const double root = sqrt((double)m) + sqrt((double)c);
-		const int r = retained(w->evals, g, sigma2 * (root * root));
+		double cut;
+		if (o->filter == DN_TFILTER_OPTTHRESH) {
+			const double lo = fmin((double)m, (double)c), hi = fmax((double)m, (double)c);
+			const double ls = dn_lambda_star(lo / hi);
+			if (!isfinite(ls)) return 1;
+			cut = sigma2 * (ls * ls) * hi;
+		} else {
+			const double root = sqrt((double)m) + sqrt((double)c);
+			cut = sigma2 * (root * root);
+		}
+		const int r = retained(w->evals, g, cut);
 		const double *f = NULL;
-		if (lev == K - 1 && o->shrink_last && r > 0) {
+		if (lev == K - 1 && o->filter == DN_TFILTER_OPTSHRINK && r > 0) {
 			// Gavish & Donoho 2017's Frobenius-optimal shrinkage, in unnormalized
 			// units, against the residual sizes left once r are kept.  The rank
 			// adjustment is Olesen's (Tensor-MP-PCA, kept by ME-PCA), not GD's:

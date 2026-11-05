@@ -92,7 +92,7 @@ def run_kernel_case(kernel, x, shrink, demean, sigma2):
             str(kernel),
             "run",
             *(str(n) for n in x.shape),
-            str(int(shrink)),
+            "optshrink" if shrink else "truncate",
             str(int(demean)),
             repr(float(sigma2)),
         ],
@@ -229,7 +229,7 @@ def image_case(binary, name, data, window, options, mask, order, tmp):
     c_flags = {
         "stride": ("-tensor_stride", lambda v: str(v)),
         "center_assign": ("-tensor_center", lambda v: "y" if v else "n"),
-        "opt_shrink": ("-tensor_shrink", lambda v: "y" if v else "n"),
+        "opt_shrink": ("-tensor_filter", lambda v: "optshrink" if v else "truncate"),
         "subtract_mean": ("-tensor_demean", lambda v: "y" if v else "n"),
         "sigma2": ("-tensor_sigma2", lambda v: repr(float(v))),
     }

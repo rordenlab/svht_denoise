@@ -8,8 +8,10 @@
 // NOT estimated here.  The kernel takes it as given, and the CLI supplies the
 // same Gavish & Donoho median-estimator map the matrix denoiser reads, so no
 // Marchenko-Pastur fit is used anywhere -- the one place this departs from
-// Olesen et al., whose MP-PCA pooled fit is deliberately not implemented.  The
-// last mode's kept values get Gavish & Donoho's 2017 Frobenius shrinkage.
+// Olesen et al., whose MP-PCA pooled fit is deliberately not implemented.  By
+// default the last mode's kept values get Gavish & Donoho's 2017 Frobenius
+// shrinkage; DN_TFILTER_OPTTHRESH replaces the edge cut at every level with
+// their 2014 known-noise hard threshold instead.
 
 #ifndef DN_TENSOR_H
 #define DN_TENSOR_H
@@ -23,11 +25,19 @@ extern "C" {
 
 #define DN_TENSOR_MAX_MODES 8
 
+// How each level chooses, and the last level weights, its components.  The
+// order matches -tensor_filter's choices.
+enum {
+	DN_TFILTER_OPTSHRINK = 0, // cut at the bulk edge; GD 2017 shrinkage on the last mode
+	DN_TFILTER_TRUNCATE,      // cut at the bulk edge; nothing shrunk
+	DN_TFILTER_OPTTHRESH      // GD 2014 known-sigma hard threshold at every level
+};
+
 // Kernel settings.  Everything here is constant for a whole run.
 typedef struct {
 	int nmodes;                       // K >= 3; a matrix is not denoised here
 	int dims[DN_TENSOR_MAX_MODES];    // every one >= 2
-	int shrink_last;    // GD 2017 Frobenius shrinkage on the last mode's retained values
+	int filter;         // DN_TFILTER_*
 	int subtract_mean;  // center each unfolding along its longer side first
 } dn_tensor_opts;
 

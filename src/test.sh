@@ -863,6 +863,34 @@ done
 check "tensor: center assignment RMS anchor" 0 "$GEN" rms "$WORK/tc_echo-1.nii" 668.046525 1e-6
 check "tensor: demeaned RMS anchor" 0 "$GEN" rms "$WORK/td_echo-1.nii" 667.610777 1e-6
 check "tensor: mode order RMS anchor" 0 "$GEN" rms "$WORK/to_echo-1.nii" 667.628282 1e-6
+# -tensor_filter.  truncate is the default's cut without the shrinkage;
+# optthresh cuts every mode HIGHER (lambda_* exceeds 1 + sqrt(beta)), so its
+# space-mode rank can never exceed truncate's in any window, and must differ
+# from both while still denoising.
+check "tensor: -tensor_filter truncate" 0 "$BIN" "$E1" "$WORK/tf.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-tensor_filter truncate -rank "$WORK/tf_rank.nii"
+check "tensor: -tensor_filter optthresh" 0 "$BIN" "$E1" "$WORK/tt.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-tensor_filter optthresh -rank "$WORK/tt_rank.nii"
+for f in tf tt; do
+	if cmp -s "$WORK/${f}_echo-1.nii" "$WORK/t_echo-1.nii"
+	then bad "tensor: $f gave the default answer"; else ok "tensor: $f differs from optshrink"; fi
+done
+if cmp -s "$WORK/tt_echo-1.nii" "$WORK/tf_echo-1.nii"
+then bad "tensor: optthresh gave truncate's answer"; else ok "tensor: optthresh differs from truncate"; fi
+rf=$("$GEN" volrms "$WORK/tf_rank.nii" 0 1 0 || true); rt=$("$GEN" volrms "$WORK/tt_rank.nii" 0 1 0 || true)
+if awk -v t="$rt" -v f="$rf" 'BEGIN { exit !(t > 0 && t < f) }'
+then ok "tensor: optthresh keeps fewer space components ($rt against $rf)"
+else bad "tensor: optthresh does not cut above the edge ($rt against $rf)"; fi
+for k in 1 2 3; do
+	before=$(err "$WORK/me-$k.nii" "$WORK/me-clean-$k.nii"); after=$(err "$WORK/tt_echo-$k.nii" "$WORK/me-clean-$k.nii")
+	if awk -v a="$after" -v b="$before" 'BEGIN { exit !(a < 0.7 * b) }'
+	then ok "tensor: optthresh echo $k closer to the truth ($before -> $after)"
+	else bad "tensor: optthresh echo $k not denoised ($before -> $after)"; fi
+done
+check "tensor: truncate RMS anchor" 0 "$GEN" rms "$WORK/tf_echo-1.nii" 667.625707 1e-6
+check "tensor: optthresh RMS anchor" 0 "$GEN" rms "$WORK/tt_echo-1.nii" 667.586047 1e-6
+check "tensor: unknown -tensor_filter" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_filter optimal
+check "-tensor_filter without -tensor" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet -tensor_filter optthresh
 check "tensor: echo on another grid"   1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-shift-2.nii"
 check "tensor: echo with another TR"   1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-tr-2.nii"
 check "tensor: echo with fewer volumes" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-short-2.nii"

@@ -7,7 +7,11 @@
 //     and without centring (which takes the reverse pass through the means);
 //   - an all-zero patch stays zero with nothing kept;
 //   - given the true variance, the output is closer to a low-rank truth than
-//     the input, on tall, wide and mixed shapes;
+//     the input, on tall, wide and mixed shapes, under the edge cut and
+//     optthresh alike;
+//   - a component between the bulk edge and the optimal hard threshold is
+//     kept by the one and dropped by the other, and optthresh keeps what it
+//     keeps unshrunk;
 //   - an unusable variance or geometry is refused rather than run.
 
 #include <math.h>
@@ -86,19 +90,23 @@ static dn_tensor_opts opts(const int *d) {
 	memset(&o, 0, sizeof o);
 	o.nmodes = 3;
 	for (int k = 0; k < 3; k++) o.dims[k] = d[k];
-	o.shrink_last = 1;
+	o.filter = DN_TFILTER_OPTSHRINK;
 	return o;
 }
 
-// `dn_tensortest run d0 d1 d2 shrink demean sigma2`: denoise one column-major
+// `dn_tensortest run d0 d1 d2 filter demean sigma2`: denoise one column-major
 // float64 tensor from stdin to stdout, printing the kept ranks "r0 r1 r2" on
-// stderr.  The kernel-level half of tools/tensor_parity.py.
+// stderr.  filter is optshrink, truncate or optthresh.  The kernel-level half
+// of tools/tensor_parity.py.
 static int run_raw(int argc, char **argv) {
 	if (argc != 8) return 2;
 	int d[3];
 	for (int k = 0; k < 3; k++) d[k] = atoi(argv[2 + k]);
 	dn_tensor_opts o = opts(d);
-	o.shrink_last = atoi(argv[5]);
+	if (!strcmp(argv[5], "optshrink")) o.filter = DN_TFILTER_OPTSHRINK;
+	else if (!strcmp(argv[5], "truncate")) o.filter = DN_TFILTER_TRUNCATE;
+	else if (!strcmp(argv[5], "optthresh")) o.filter = DN_TFILTER_OPTTHRESH;
+	else return 2;
 	o.subtract_mean = atoi(argv[6]);
 	const double sigma2 = atof(argv[7]);
 	if (dn_tensor_check(&o)) return 2;
@@ -159,6 +167,66 @@ int main(int argc, char **argv) {
 			report(!rc && e0 < 1e-12, msg);
 		}
 		free(clean); free(noisy); free(x);
+	}
+
+	// optthresh on a noisy low-rank tensor: still closer to the truth, and never
+	// keeping more at level 0 than the bulk edge does, since its cut is higher.
+	// Later levels see the ranks before them, so only level 0 is comparable.
+	for (int s = 0; s < nshape; s++) {
+		const int *d = shapes[s];
+		const size_t n = (size_t)d[0] * d[1] * d[2];
+		double *clean = malloc(n * sizeof(double)), *noisy = malloc(n * sizeof(double));
+		double *x = malloc(n * sizeof(double));
+		if (!clean || !noisy || !x) return 2;
+		make(d, rk[s], 1.0, (uint32_t)s + 1u, clean, noisy);
+		const double before = rel_l2(noisy, clean, n);
+		int rt[3], ro[3];
+		dn_tensor_opts o = opts(d);
+		o.filter = DN_TFILTER_TRUNCATE;
+		memcpy(x, noisy, n * sizeof(double));
+		const int rc_t = run(&o, x, 1.0, rt);
+		o.filter = DN_TFILTER_OPTTHRESH;
+		memcpy(x, noisy, n * sizeof(double));
+		const int rc_o = run(&o, x, 1.0, ro);
+		snprintf(msg, sizeof msg, "(%d,%d,%d) optthresh closer to the truth: %.4g -> %.4g, "
+		         "ranks %d,%d,%d (edge: %d,%d,%d)", d[0], d[1], d[2], before, rel_l2(x, clean, n),
+		         ro[0], ro[1], ro[2], rt[0], rt[1], rt[2]);
+		report(!rc_t && !rc_o && rel_l2(x, clean, n) < before && ro[0] <= rt[0], msg);
+		free(clean); free(noisy); free(x);
+	}
+
+	// The two cuts on a rank-1 tensor of known singular value s, the same at
+	// every level.  On (8,6,4) at unit variance, level 0 (8 x 24) has its edge
+	// at s^2 = (sqrt 8 + sqrt 24)^2 = 59.7 and lambda_*(1/3)^2 * 24 = 81.1 for
+	// optthresh; level 1 (6 x 4) cuts lower, at 19.8 and 26.5.  So s^2 = 70 is
+	// kept by the edge and dropped by optthresh, and s^2 = 100 is kept by both,
+	// WHOLE under optthresh and truncate and shrunk under optshrink.
+	{
+		const int d[3] = {8, 6, 4};
+		const size_t n = 8 * 6 * 4;
+		double x[8 * 6 * 4], in[8 * 6 * 4];
+		static const double s2s[2] = {70.0, 100.0};
+		for (int t = 0; t < 2; t++) {
+			const double amp = sqrt(s2s[t] / (double)n);
+			for (size_t i = 0; i < n; i++) in[i] = amp;
+			int r[3];
+			for (int f = DN_TFILTER_OPTSHRINK; f <= DN_TFILTER_OPTTHRESH; f++) {
+				dn_tensor_opts o = opts(d);
+				o.filter = f;
+				memcpy(x, in, sizeof x);
+				const int rc = run(&o, x, 1.0, r);
+				const double e = rel_l2(x, in, n);
+				const char *name = f == DN_TFILTER_OPTSHRINK ? "optshrink"
+				                 : f == DN_TFILTER_TRUNCATE ? "truncate" : "optthresh";
+				int ok;
+				if (t == 0 && f == DN_TFILTER_OPTTHRESH) ok = r[0] == 0 && e == 1.0;
+				else if (f == DN_TFILTER_OPTSHRINK) ok = r[0] == 1 && e > 1e-3 && e < 1.0;
+				else ok = r[0] == 1 && e < 1e-12;
+				snprintf(msg, sizeof msg, "rank-1, s^2 = %g, %s: level-0 rank %d, rel L2 to input %.3g",
+				         s2s[t], name, r[0], e);
+				report(!rc && ok, msg);
+			}
+		}
 	}
 
 	// All zero: nothing kept, nothing invented, at any variance.
