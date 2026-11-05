@@ -38,6 +38,7 @@ typedef struct {
 	int nmodes;                       // K >= 3; a matrix is not denoised here
 	int dims[DN_TENSOR_MAX_MODES];    // every one >= 2
 	int filter;         // DN_TFILTER_*
+	int shrink_observed; // optshrink: GD's observed m x c, not Olesen's (m-r) x (c-r)
 	int subtract_mean;  // center each unfolding along its longer side first
 } dn_tensor_opts;
 

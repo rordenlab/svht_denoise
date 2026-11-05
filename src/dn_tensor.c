@@ -364,20 +364,31 @@ int dn_tensor_denoise(const dn_tensor_opts *o, dn_tensor_work *w, double *x,
 		const int r = retained(w->evals, g, cut);
 		const double *f = NULL;
 		if (lev == K - 1 && o->filter == DN_TFILTER_OPTSHRINK && r > 0) {
-			// Gavish & Donoho 2017's Frobenius-optimal shrinkage, in unnormalized
-			// units, against the residual sizes left once r are kept.  The rank
-			// adjustment is Olesen's (Tensor-MP-PCA, kept by ME-PCA), not GD's:
-			// matrix mode uses the observed m and c.  It shrinks kept values
-			// slightly less (rows 5 -> 1 at five echoes, ~1% of the subtracted
-			// term on ds006131), and its zero lies BELOW the bulk edge, so the
-			// edge cut above, not the shrinker, decides what is discarded.  Kept
-			// for parity with ME-PCA; changing it is a methods change.
-			const double rows = fmax((double)(m - r), 1.0), cols = fmax((double)c - r, 1.0);
+			// Gavish & Donoho 2017's Frobenius-optimal shrinkage in unnormalized
+			// units, eta^2 = s^2 - 2(R+C) sigma2 + (C-R)^2 sigma2^2 / s^2.
+			//   observed (GD): R x C is the unfolding, m x c, as in matrix mode.
+			//     eta reaches zero exactly at the bulk edge, so a component fades
+			//     out continuously as it approaches the cut.
+			//   rank-adjusted (Olesen's Tensor-MP-PCA, kept by ME-PCA): R = m - r,
+			//     C = c - r, the residual sizes once r are kept.  C - R is
+			//     unchanged and R + C falls by 2r, so this is eta^2 + 4 r sigma2
+			//     wherever the floor at 1 does not bind: every kept value gains
+			//     the same energy, and a component just above the edge keeps a
+			//     weight of about 2 sqrt(r) / (sqrt(m) + sqrt(c)) rather than 0 --
+			//     a step at the cut that the 2017 shrinker exists to avoid.
+			// Neither is derived for this matrix: it is the projection the earlier
+			// levels kept, chosen from the same noise, so GD's iid premise fails.
+			// Measured (README): the two agree to 0.03% when the last mode is
+			// echo, and olesen wins by 0.1-0.5% when time is last, where the
+			// shrunk components sit near the edge.  So olesen is the default.
+			const int adj = !o->shrink_observed;
+			const double rows = adj ? fmax((double)(m - r), 1.0) : (double)m;
+			const double cols = adj ? fmax((double)c - r, 1.0) : (double)c;
 			for (int k = 0; k < r; k++) {
 				const double s2 = w->evals[g - 1 - k];
 				const double v = s2 - 2.0 * (cols + rows) * sigma2 +
 				                 (cols - rows) * (cols - rows) * (sigma2 * sigma2) / s2;
-				w->f[k] = sqrt(fmax(v, 0.0)) / sqrt(s2);
+				w->f[k] = fmin(sqrt(fmax(v, 0.0)) / sqrt(s2), 1.0);
 			}
 			f = w->f;
 		}

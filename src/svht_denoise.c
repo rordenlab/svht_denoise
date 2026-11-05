@@ -174,7 +174,7 @@ static void usage(void) {
 	printf("  Each patch is a space x time x echo TENSOR, denoised mode by mode in the\n");
 	printf("  recursive scheme of Olesen et al. (Magn Reson Med 2022): each unfolding is\n");
 	printf("  cut at the edge of its noise bulk and the last mode's kept values are\n");
-	printf("  shrunk, unless -tensor_filter says otherwise.  The noise level\n");
+	printf("  shrunk, unless -filter says otherwise.  The noise level\n");
 	printf("  of each echo comes from the same Gavish & Donoho median-estimator map the\n");
 	printf("  matrix denoiser reads, and each echo is put in units of its OWN noise\n");
 	printf("  before the tensor is built (echoes rarely share one), then mapped back; no\n");
@@ -186,10 +186,6 @@ static void usage(void) {
 	printf("  \"_echo-<k>\" before its extension: out.nii.gz -> out_echo-1.nii.gz, ...\n");
 	printf("  -tensor gd            select tensor mode; the only tensor method\n");
 	printf("  -echo <image>         the next echo, in echo order; repeat for each\n");
-	printf("  -tensor_phase <image> one echo's phase, in echo order; repeat for each.\n");
-	printf("                        Each echo is rotated onto the real axis with its\n");
-	printf("                        own phase, as -phase does in matrix mode, so the\n");
-	printf("                        OUTPUT IS SIGNED.  -phaseunits applies to all of them.\n");
 	printf("  -tensor_window <w>    x,y,z for a local window (default 5,5,5), or x,y for\n");
 	printf("                        an in-plane window spanning every slice\n");
 	printf("  -tensor_stride <s>    window step: one value, or one per window size\n");
@@ -206,25 +202,14 @@ static void usage(void) {
 	printf("                        echo-specific parallel-imaging reconstructions can\n");
 	printf("                        give each echo its own noise level, which the summary's\n");
 	printf("                        per-echo medians show.\n");
-	printf("  -tensor_vst <y/n>     variance-stabilize each MAGNITUDE echo against its\n");
-	printf("                        map (Rician; exact-unbiased inverse), as -vst does in\n");
-	printf("                        matrix mode, rather than only scaling it by the map.\n");
-	printf("                        Default y for magnitude; refused with -tensor_phase\n");
-	printf("                        (already Gaussian) and -tensor_sigma2 (no map).\n");
-	printf("  -tensor_filter <f>    how each mode keeps components: optshrink (default),\n");
-	printf("                        cut at the bulk edge with the last mode's kept values\n");
-	printf("                        shrunk (Gavish & Donoho 2017); truncate, the same cut\n");
-	printf("                        with nothing shrunk; or optthresh, Gavish & Donoho\n");
-	printf("                        2014's KNOWN-noise optimal hard threshold at every\n");
-	printf("                        mode, lambda*(beta) sigma sqrt(n), nothing shrunk.\n");
-	printf("                        All three read the same per-echo noise; matrix\n");
-	printf("                        optthresh's unknown-noise rule needs a median over\n");
-	printf("                        many noise values, which the echo mode lacks.\n");
+	printf("  -tensor_shrinker <s>  the dimensions -filter optshrink's last-mode shrinker\n");
+	printf("                        uses: olesen (default), the unfolding less the kept\n");
+	printf("                        rank, (m-r) x (c-r), as Olesen et al. and ME-PCA do;\n");
+	printf("                        or gd, the observed m x c, as Gavish & Donoho derive\n");
+	printf("                        it and matrix mode uses.  olesen adds 4 r sigma^2 to\n");
+	printf("                        every kept value's square, so a component just above\n");
+	printf("                        the cut keeps a weight where gd's fades to zero.\n");
 	printf("  -tensor_demean <y/n>  center each unfolding along its longer side (default n)\n");
-	printf("  -tensor_center <y/n>  write only each window's center voxel (its center\n");
-	printf("                        column for an x,y window) instead of averaging\n");
-	printf("                        (default n).  With -mask, a window whose center is\n");
-	printf("                        outside the mask is skipped, as in ME-PCA.\n");
 	printf("  -mask <image>         denoise only windows that touch the mask.  Unlike\n");
 	printf("                        matrix mode, such a window writes every voxel it\n");
 	printf("                        covers, and voxels outside the mask are not zeroed.\n");
@@ -235,7 +220,32 @@ static void usage(void) {
 	printf("                        -tensor_order (float32; the header names them)\n");
 	printf("  -snr_gain <image>     Olesen et al.'s SNR-gain heuristic, from the mean ranks;\n");
 	printf("                        NaN where nothing was kept (float32)\n");
-	printf("  None of the matrix denoiser's options apply, and each is refused.\n");
+	printf("  Shared with matrix mode, with these meanings here:\n");
+	printf("  -phase <image>        one echo's phase, in echo order; repeat for each.\n");
+	printf("                        Each echo is rotated onto the real axis with its own\n");
+	printf("                        phase, so the OUTPUT IS SIGNED.  -phaseunits applies\n");
+	printf("                        to all of them.\n");
+	printf("  -filter <f>           optshrink (default), cut at each mode's bulk edge with\n");
+	printf("                        the last mode's kept values shrunk (Gavish & Donoho\n");
+	printf("                        2017); truncate, the same cuts with nothing shrunk; or\n");
+	printf("                        optthresh, Gavish & Donoho 2014's KNOWN-noise optimal\n");
+	printf("                        hard threshold at every mode, lambda*(beta) sigma\n");
+	printf("                        sqrt(n), nothing shrunk.  All three read the per-echo\n");
+	printf("                        noise.  Matrix optthresh is their UNKNOWN-noise rule\n");
+	printf("                        instead, a median over many noise values, which the\n");
+	printf("                        echo mode does not have.\n");
+	printf("  -vst <y/n>            variance-stabilize each MAGNITUDE echo against its map,\n");
+	printf("                        rather than only scaling it by the map.  Default y for\n");
+	printf("                        magnitude; refused with -phase (already Gaussian) and\n");
+	printf("                        -tensor_sigma2 (no map).  -noise_dof and\n");
+	printf("                        -preserve_noise_bias apply to it as in matrix mode.\n");
+	printf("  -aggregator <a>       uniform (default), every window's estimate averaged\n");
+	printf("                        over the voxels it covers; or exclusive, each window\n");
+	printf("                        writing only its center voxel (its center column for\n");
+	printf("                        an x,y window).  With -mask, an exclusive window whose\n");
+	printf("                        center is outside the mask is skipped, as in ME-PCA.\n");
+	printf("                        gaussian is matrix mode's only.\n");
+	printf("  The matrix denoiser's other options are refused.\n");
 	printf("\n");
 	printf("COMMON OPTIONS\n");
 	printf("  -nthreads <n>     worker threads (default: all cores). -p is an alias.\n");
@@ -556,13 +566,15 @@ typedef struct {
 	const char *fin, *fout, *fmask, *fnoise, *frank, *fgain;
 	const char *echoes[DN_TENSOR_MAX_ECHO - 1];  // echoes 2.., in order
 	int nechos;
-	const char *phases[DN_TENSOR_MAX_ECHO];      // -tensor_phase, one per echo, in order
+	const char *phases[DN_TENSOR_MAX_ECHO];      // -phase, one per echo, in order
 	int nphases;
 	dn_phase_units punits;
 	const char *window, *stride, *order;         // as typed, or NULL for the default
-	int filter;  // -tensor_filter: DN_TFILTER_*
-	int demean, center, known;
-	int vst;     // -tensor_vst: 0, 1, or -1 for the default
+	int filter;  // -filter, as DN_TFILTER_*
+	int shrink_observed, shrinker_given;  // -tensor_shrinker gd / given at all
+	int demean, center, known;            // center: -aggregator exclusive
+	int vst;     // -vst: 0, 1, or -1 for the default
+	int ncoil, ncoil_given, keep_bias;    // -noise_dof, -preserve_noise_bias
 	int pooled;  // -tensor_noise pooled: one noise map for every echo
 	double sigma2;
 	int nthreads, quiet;
@@ -631,7 +643,7 @@ static int cmp_float_asc(const void *pa, const void *pb) {
 //   vt != NULL  magnitude: variance-stabilized with matrix mode's transform
 //               and its DN_VST_ROUNDS re-estimation, so Rician noise becomes
 //               unit Gaussian too and the noise-floor bias can be undone;
-//   vt == NULL  signed data (rotated to real), or -tensor_vst n: divided by
+//   vt == NULL  signed data (rotated to real), or -vst n: divided by
 //               the map, which is all Gaussian noise needs.
 // Every map is estimated before any echo is transformed, so noiseless data
 // (*none: every echo) are left untouched, and a noiseless echo among noisy
@@ -740,10 +752,12 @@ static int tensor_normalize(dn_image *img, int ne, const dn_vst *vt, int pooled,
 // or sigma times the value.  A voxel no window covered (NaN in `cover`) still
 // holds its normalized INPUT, so it goes back through the algebraic inverse,
 // which is f's exact inverse, and keeps its input value to float rounding.
+// keep_bias (-preserve_noise_bias) sends covered voxels through the algebraic
+// inverse too, keeping the noise floor, as it does in matrix mode.
 static void tensor_restore(float *out, size_t nv, int nt, const float *sigma, const uint8_t *live,
-                           const dn_vst *vt, const float *cover) {
+                           const dn_vst *vt, const float *cover, int keep_bias) {
 	for (size_t v = 0; v < nv; v++) {
-		const int covered = !isnan(cover[v]);
+		const int covered = !isnan(cover[v]) && !keep_bias;
 		const double s = sigma[v];
 		for (int j = 0; j < nt; j++) {
 			float *o = out + v + (size_t)j * nv;
@@ -787,6 +801,7 @@ static int run_tensor(const tensor_cli *t) {
 	dn_trun r;
 	memset(&r, 0, sizeof r);
 	r.k.filter = t->filter;
+	r.k.shrink_observed = t->shrink_observed;
 	r.k.subtract_mean = t->demean;
 	r.sigma2 = t->sigma2;
 	r.center_assign = t->center;
@@ -863,21 +878,21 @@ static int run_tensor(const tensor_cli *t) {
 		}
 	}
 	// Magnitude in: ME-PCA, whose window rules these are, takes abs() of its
-	// input, which silently destroys a signed series, and -tensor_phase rotates
+	// input, which silently destroys a signed series, and -phase rotates
 	// a magnitude.  A series that is already signed is refused either way.
 	for (int e = 0; e < ne; e++)
 		for (size_t i = 0; i < img[e].nvox3d * (size_t)img[e].nvol; i++)
 			if (img[e].data[i] < 0.0f) {
 				dn_err("echo '%s' has negative values; tensor mode expects MAGNITUDE images\n", fin[e]);
-				dn_err("  (with -tensor_phase for complex data).\n");
+				dn_err("  (with -phase for complex data).\n");
 				goto done;
 			}
 	if (t->nphases && t->nphases != ne) {
-		dn_err("%d -tensor_phase images for %d echoes; give one per echo, in echo order.\n",
+		dn_err("%d -phase images for %d echoes; give one per echo, in echo order.\n",
 		       t->nphases, ne);
 		goto done;
 	}
-	// -tensor_vst: on for magnitude by default, as -vst is in matrix mode.  It
+	// -vst: on for magnitude by default, as in matrix mode.  It
 	// stabilizes against each echo's estimated map, so a known variance leaves
 	// it nothing to stabilize against, and rotated data are Gaussian already.
 	const int vst = t->vst < 0 ? (!t->nphases && !t->known) : t->vst;
@@ -886,9 +901,13 @@ static int run_tensor(const tensor_cli *t) {
 		goto done;
 	}
 	if (vst && (t->nphases || t->known)) {
-		dn_err("-tensor_vst stabilizes magnitude against each echo's estimated noise map;\n");
-		dn_err("  %s.\n", t->nphases ? "-tensor_phase data are rotated to real and already Gaussian"
+		dn_err("-vst stabilizes magnitude against each echo's estimated noise map;\n");
+		dn_err("  %s.\n", t->nphases ? "-phase data are rotated to real and already Gaussian"
 		                             : "-tensor_sigma2 gives no map to stabilize against");
+		goto done;
+	}
+	if ((t->ncoil_given || t->keep_bias) && !vst) {
+		dn_err("-noise_dof and -preserve_noise_bias describe -vst y, which is off for this run.\n");
 		goto done;
 	}
 
@@ -918,7 +937,7 @@ static int run_tensor(const tensor_cli *t) {
 	for (int e = 0; e < ne; e++) {
 		paths[e] = (dn_path){"echo", fin[e], 1, NULL, NULL};
 		paths[ne + e] = (dn_path){"echo output", oname[e], 0, NULL, NULL};
-		paths[2 * ne + e] = (dn_path){"-tensor_phase", t->nphases ? t->phases[e] : NULL, 1, NULL, NULL};
+		paths[2 * ne + e] = (dn_path){"-phase", t->nphases ? t->phases[e] : NULL, 1, NULL, NULL};
 	}
 	paths[3 * ne] = (dn_path){"-mask", t->fmask, 1, NULL, NULL};
 	paths[3 * ne + 1] = (dn_path){"-noise", t->fnoise, 0, NULL, NULL};
@@ -954,7 +973,7 @@ static int run_tensor(const tensor_cli *t) {
 			dn_err("  give it with -tensor_sigma2 instead.\n");
 			goto done;
 		}
-		if (vst && !(vt = dn_vst_create(1))) goto done;
+		if (vst && !(vt = dn_vst_create(t->ncoil))) goto done;
 		if (tensor_normalize(img, ne, vt, t->pooled, nthreads_req, sigmas, lives, med, &noiseless)) goto done;
 		if (noiseless) {
 			dn_err("note: no noise level could be estimated, so every component is kept\n");
@@ -984,7 +1003,11 @@ static int run_tensor(const tensor_cli *t) {
 		else if (!noiseless) {
 			dn_err("noise        : Gavish-Donoho median map %s; each echo %s\n",
 			       t->pooled ? "pooled over the echoes" : "of each echo",
-			       vst ? "variance-stabilized against it (Rician, exact-unbiased inverse)" : "scaled by it");
+			       !vst ? "scaled by it"
+			       : t->keep_bias ? "variance-stabilized against it (algebraic inverse, noise floor kept)"
+			                      : "variance-stabilized against it (exact-unbiased inverse)");
+			if (vst) dn_err("  noise model: %s\n", t->ncoil == 1 ? "Rician" : "non-central chi");
+			if (vst && t->ncoil > 1) dn_err("  receive channels: %d\n", t->ncoil);
 			dn_err("  median sigma by echo%s:", t->pooled ? " before pooling" : "");
 			for (int e = 0; e < ne; e++) fprintf(stderr, " %.4g", med[e]);
 			fprintf(stderr, "\n");
@@ -992,7 +1015,10 @@ static int run_tensor(const tensor_cli *t) {
 		dn_err("filter       : %s\n",
 		       t->filter == DN_TFILTER_OPTTHRESH ? "optthresh: known-noise optimal hard threshold, every mode"
 		       : t->filter == DN_TFILTER_TRUNCATE ? "truncate: bulk edge, nothing shrunk"
-		       : "optshrink: bulk edge, Frobenius-optimal shrinkage on the last mode");
+		       : t->shrink_observed ? "optshrink: bulk edge, Frobenius-optimal shrinkage on the last mode "
+		                              "(Gavish-Donoho, observed dimensions)"
+		                            : "optshrink: bulk edge, Frobenius-optimal shrinkage on the last mode "
+		                              "(Olesen's rank-adjusted dimensions)");
 		if (t->demean) dn_err("demean       : every unfolding, along its longer side\n");
 		dn_err("aggregation  : %s, stride %d,%d,%d\n",
 		       t->center ? "window center only" : "uniform mean of every window", r.stride[0], r.stride[1],
@@ -1020,7 +1046,7 @@ static int run_tensor(const tensor_cli *t) {
 	r.gain = gain;
 	if (dn_tensor_execute(&r)) goto done;
 	if (normalized)
-		for (int e = 0; e < ne; e++) tensor_restore(out[e], nv, r.nt, sigmas[e], lives[e], vt, sig);
+		for (int e = 0; e < ne; e++) tensor_restore(out[e], nv, r.nt, sigmas[e], lives[e], vt, sig, t->keep_bias);
 
 	// Maps first, as in matrix mode.  -noise is the standard deviation, the unit
 	// matrix mode writes too, one volume per echo: the square root of the mean
@@ -1088,6 +1114,12 @@ int main(int argc, char *argv[]) {
 	int vst = -1, ncoil = 1, ncoil_given = 0, keep_bias = 0;   // -1: auto
 	// Options that only the denoiser reads, counted so -degibbs o can refuse them.
 	int denoise_opts = 0;
+	// Those among them that tensor mode reads too (-filter, -vst, -aggregator,
+	// -noise_dof, -preserve_noise_bias), so it refuses only the rest.
+	int shared_opts = 0, agg_given = 0;
+	// -phase, repeatable: one image in matrix mode, one per echo in tensor mode.
+	const char *phases[DN_TENSOR_MAX_ECHO];
+	int nphases = 0;
 	static const char *const yes_no[] = {"n", "y", NULL};
 	static const char *const filters[] = {"optthresh", "optshrink", "truncate", NULL};   // DN_FILTER_*
 	static const char *const shapes[] = {"cube", "sphere", NULL};                        // DN_SHAPE_*
@@ -1128,7 +1160,7 @@ int main(int argc, char *argv[]) {
 			return EXIT_SUCCESS;
 		}
 		if (!strcmp(a, "-quiet")) { quiet = 1; continue; }
-		if (!strcmp(a, "-preserve_noise_bias")) { keep_bias = 1; denoise_opts++; continue; }
+		if (!strcmp(a, "-preserve_noise_bias")) { keep_bias = 1; denoise_opts++; shared_opts++; continue; }
 
 		if (a[0] == '-' && a[1] != '\0') {
 			// Every remaining flag takes exactly one argument.
@@ -1140,12 +1172,21 @@ int main(int argc, char *argv[]) {
 			if (!strcmp(a, "-mask")) fmask = v;
 			else if (!strcmp(a, "-noise")) fnoise = v;
 			else if (!strcmp(a, "-rank")) frank = v;
-			else if (!strcmp(a, "-phase")) fphase = v;
+			else if (!strcmp(a, "-phase")) {
+				if (nphases >= DN_TENSOR_MAX_ECHO) {
+					dn_err("at most %d -phase images\n", DN_TENSOR_MAX_ECHO);
+					return EXIT_FAILURE;
+				}
+				phases[nphases++] = v;
+				fphase = phases[0];
+			}
 			else if (!strcmp(a, "-real")) freal = v;
 			else if (!strcmp(a, "-bval")) { fbval = v; denoise_opts++; }
 			else if (!strcmp(a, "-vst") || !strcmp(a, "-demean") || !strcmp(a, "-filter") ||
 			         !strcmp(a, "-shape") || !strcmp(a, "-aggregator")) {
 				denoise_opts++;
+				if (!strcmp(a, "-vst") || !strcmp(a, "-filter") || !strcmp(a, "-aggregator")) shared_opts++;
+				if (!strcmp(a, "-aggregator")) agg_given = 1;
 				int bad;
 				if (!strcmp(a, "-vst")) bad = parse_choice(a, v, yes_no, &vst);
 				else if (!strcmp(a, "-demean")) bad = parse_choice(a, v, yes_no, &demean);
@@ -1161,6 +1202,7 @@ int main(int argc, char *argv[]) {
 				}
 				ncoil_given = 1;
 				denoise_opts++;
+				shared_opts++;
 			}
 			else if (!strcmp(a, "-aggregator_fwhm")) {
 				char *pend = NULL;
@@ -1195,14 +1237,6 @@ int main(int argc, char *argv[]) {
 				tc.given++;
 			}
 			else if (!strcmp(a, "-snr_gain")) { tc.fgain = v; tc.given++; }
-			else if (!strcmp(a, "-tensor_phase")) {
-				if (tc.nphases >= DN_TENSOR_MAX_ECHO) {
-					dn_err("at most %d -tensor_phase images\n", DN_TENSOR_MAX_ECHO);
-					return EXIT_FAILURE;
-				}
-				tc.phases[tc.nphases++] = v;
-				tc.given++;
-			}
 			else if (!strcmp(a, "-tensor_window")) { tc.window = v; tc.given++; }
 			else if (!strcmp(a, "-tensor_stride")) { tc.stride = v; tc.given++; }
 			else if (!strcmp(a, "-tensor_order")) { tc.order = v; tc.given++; }
@@ -1211,16 +1245,14 @@ int main(int argc, char *argv[]) {
 				if (parse_choice(a, v, noise_modes, &tc.pooled)) return EXIT_FAILURE;
 				tc.given++;
 			}
-			else if (!strcmp(a, "-tensor_filter")) {
-				static const char *const tfilters[] = {"optshrink", "truncate", "optthresh", NULL};  // DN_TFILTER_*
-				if (parse_choice(a, v, tfilters, &tc.filter)) return EXIT_FAILURE;
+			else if (!strcmp(a, "-tensor_shrinker")) {
+				static const char *const shrinkers[] = {"olesen", "gd", NULL};
+				if (parse_choice(a, v, shrinkers, &tc.shrink_observed)) return EXIT_FAILURE;
+				tc.shrinker_given = 1;
 				tc.given++;
 			}
-			else if (!strcmp(a, "-tensor_demean") || !strcmp(a, "-tensor_center") ||
-			         !strcmp(a, "-tensor_vst")) {
-				int *dst = !strcmp(a, "-tensor_demean") ? &tc.demean
-				         : !strcmp(a, "-tensor_vst") ? &tc.vst : &tc.center;
-				if (parse_choice(a, v, yes_no, dst)) return EXIT_FAILURE;
+			else if (!strcmp(a, "-tensor_demean")) {
+				if (parse_choice(a, v, yes_no, &tc.demean)) return EXIT_FAILURE;
 				tc.given++;
 			}
 			else if (!strcmp(a, "-tensor_sigma2")) {
@@ -1333,21 +1365,43 @@ int main(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 	if (tc.method) {
-		int matrix_opts = denoise_opts + (fphase != NULL) + (freal != NULL) + extent_given +
+		int matrix_opts = denoise_opts - shared_opts + (freal != NULL) + extent_given +
 		                  (degibbs != DN_DG_NO);
 #ifdef DN_DEGIBBS
 		matrix_opts += pf_given;
 #endif
 		if (matrix_opts) {
-			dn_err("-tensor gd takes none of the matrix denoiser's options (-phase, -real,\n");
-			dn_err("  -bval, -demean, -filter, -shape, -aggregator(_fwhm), -stride, -vst,\n");
-			dn_err("  -noise_dof, -preserve_noise_bias, -extent, -degibbs, -pF); its own are\n");
-			dn_err("  the -tensor_* options, and -tensor_phase takes each echo's phase.\n");
+			dn_err("-tensor gd shares -phase, -phaseunits, -filter, -vst, -noise_dof,\n");
+			dn_err("  -preserve_noise_bias and -aggregator with the matrix denoiser, but none\n");
+			dn_err("  of its other options (-real, -bval, -demean, -shape, -aggregator_fwhm,\n");
+			dn_err("  -stride, -extent, -degibbs, -pF); its own are the -tensor_* options.\n");
 			return EXIT_FAILURE;
 		}
+		// -aggregator: a window's estimate is averaged over every voxel it covers
+		// (uniform, the default here, as in ME-PCA) or written at its center only
+		// (exclusive).  Matrix mode's Gaussian weighting is not implemented.
+		if (agg_given && aggregator == DN_AGG_GAUSSIAN) {
+			dn_err("-aggregator gaussian is matrix mode's; tensor mode takes uniform (the\n");
+			dn_err("  default) or exclusive.\n");
+			return EXIT_FAILURE;
+		}
+		tc.center = agg_given && aggregator == DN_AGG_EXCLUSIVE;
+		tc.filter = filter == DN_FILTER_OPTTHRESH ? DN_TFILTER_OPTTHRESH
+		          : filter == DN_FILTER_TRUNCATE ? DN_TFILTER_TRUNCATE : DN_TFILTER_OPTSHRINK;
+		if (tc.shrinker_given && tc.filter != DN_TFILTER_OPTSHRINK) {
+			dn_err("-tensor_shrinker chooses optshrink's shrinker, and -filter %s shrinks nothing.\n",
+			       filters[filter]);
+			return EXIT_FAILURE;
+		}
+		tc.vst = vst;
+		tc.ncoil = ncoil;
+		tc.ncoil_given = ncoil_given;
+		tc.keep_bias = keep_bias;
+		for (int e = 0; e < nphases; e++) tc.phases[e] = phases[e];
+		tc.nphases = nphases;
 		// -phaseunits is shared: it describes whichever phase images were given.
 		if (punits_given && !tc.nphases) {
-			dn_err("-phaseunits describes the -tensor_phase images, which were not given.\n");
+			dn_err("-phaseunits describes the -phase images, which were not given.\n");
 			return EXIT_FAILURE;
 		}
 		tc.punits = punits;
@@ -1359,6 +1413,11 @@ int main(int argc, char *argv[]) {
 		tc.nthreads = nthreads;
 		tc.quiet = quiet;
 		return run_tensor(&tc);
+	}
+	if (nphases > 1) {
+		dn_err("-phase was given %d times; matrix mode takes one phase image (more than\n", nphases);
+		dn_err("  one, one per echo, is tensor mode's: -tensor gd).\n");
+		return EXIT_FAILURE;
 	}
 	// -degibbs o does no denoising, so everything describing the denoiser -- its
 	// mask, its by-products, its patch size, and the phase rotation that exists

@@ -852,10 +852,10 @@ then bad "tensor: an in-plane window gave the local window's answer"; else ok "t
 # Each option must reach the kernel: an output that matches the default means
 # it was ignored, and an anchor pins what it does.  Demeaning moves the RMS by
 # only 6e-6, so its anchor alone would barely separate it; the cmp does.
-check "tensor: center assignment" 0 "$BIN" "$E1" "$WORK/tc.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_center y
+check "tensor: center assignment" 0 "$BIN" "$E1" "$WORK/tc.nii" -quiet $TEN -echo "$E2" -echo "$E3" -aggregator exclusive
 check "tensor: demeaned" 0 "$BIN" "$E1" "$WORK/td.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_demean y
 check "tensor: mode order" 0 "$BIN" "$E1" "$WORK/to.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_order time,space,echo
-for opt in tc:-tensor_center td:-tensor_demean to:-tensor_order; do
+for opt in tc:-aggregator_exclusive td:-tensor_demean to:-tensor_order; do
 	f=${opt%%:*}; name=${opt#*:}
 	if cmp -s "$WORK/${f}_echo-1.nii" "$WORK/t_echo-1.nii"
 	then bad "tensor: $name gave the default answer"; else ok "tensor: $name changes the output"; fi
@@ -863,14 +863,14 @@ done
 check "tensor: center assignment RMS anchor" 0 "$GEN" rms "$WORK/tc_echo-1.nii" 668.046525 1e-6
 check "tensor: demeaned RMS anchor" 0 "$GEN" rms "$WORK/td_echo-1.nii" 667.610777 1e-6
 check "tensor: mode order RMS anchor" 0 "$GEN" rms "$WORK/to_echo-1.nii" 667.628282 1e-6
-# -tensor_filter.  truncate is the default's cut without the shrinkage;
+# -filter in tensor mode.  truncate is the default's cut without the shrinkage;
 # optthresh cuts every mode HIGHER (lambda_* exceeds 1 + sqrt(beta)), so its
 # space-mode rank can never exceed truncate's in any window, and must differ
 # from both while still denoising.
-check "tensor: -tensor_filter truncate" 0 "$BIN" "$E1" "$WORK/tf.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
-	-tensor_filter truncate -rank "$WORK/tf_rank.nii"
-check "tensor: -tensor_filter optthresh" 0 "$BIN" "$E1" "$WORK/tt.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
-	-tensor_filter optthresh -rank "$WORK/tt_rank.nii"
+check "tensor: -filter truncate" 0 "$BIN" "$E1" "$WORK/tf.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-filter truncate -rank "$WORK/tf_rank.nii"
+check "tensor: -filter optthresh" 0 "$BIN" "$E1" "$WORK/tt.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-filter optthresh -rank "$WORK/tt_rank.nii"
 for f in tf tt; do
 	if cmp -s "$WORK/${f}_echo-1.nii" "$WORK/t_echo-1.nii"
 	then bad "tensor: $f gave the default answer"; else ok "tensor: $f differs from optshrink"; fi
@@ -889,8 +889,51 @@ for k in 1 2 3; do
 done
 check "tensor: truncate RMS anchor" 0 "$GEN" rms "$WORK/tf_echo-1.nii" 667.625707 1e-6
 check "tensor: optthresh RMS anchor" 0 "$GEN" rms "$WORK/tt_echo-1.nii" 667.586047 1e-6
-check "tensor: unknown -tensor_filter" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_filter optimal
-check "-tensor_filter without -tensor" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet -tensor_filter optthresh
+check "tensor: unknown -filter" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -filter optimal
+check "-tensor_shrinker without -tensor" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet -tensor_shrinker gd
+# -tensor_shrinker gd: Gavish & Donoho's observed dimensions.  It shrinks every
+# kept value at least as hard as olesen's (which adds 4 r sigma^2), so it must
+# differ from the default and still denoise.
+check "tensor: -tensor_shrinker gd" 0 "$BIN" "$E1" "$WORK/tg.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-tensor_shrinker gd
+if cmp -s "$WORK/tg_echo-1.nii" "$WORK/t_echo-1.nii"
+then bad "tensor: -tensor_shrinker gd gave olesen's answer"; else ok "tensor: -tensor_shrinker gd differs from olesen"; fi
+for k in 1 2 3; do
+	before=$(err "$WORK/me-$k.nii" "$WORK/me-clean-$k.nii"); after=$(err "$WORK/tg_echo-$k.nii" "$WORK/me-clean-$k.nii")
+	if awk -v a="$after" -v b="$before" 'BEGIN { exit !(a < 0.7 * b) }'
+	then ok "tensor: gd shrinker echo $k closer to the truth ($before -> $after)"
+	else bad "tensor: gd shrinker echo $k not denoised ($before -> $after)"; fi
+done
+check "tensor: gd shrinker RMS anchor" 0 "$GEN" rms "$WORK/tg_echo-1.nii" 667.600445 1e-6
+check "tensor: explicit olesen is the default" 0 "$BIN" "$E1" "$WORK/to2.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-tensor_shrinker olesen
+if cmp -s "$WORK/to2_echo-1.nii" "$WORK/t_echo-1.nii"
+then ok "tensor: -tensor_shrinker olesen is byte-identical to the default"
+else bad "tensor: -tensor_shrinker olesen differs from the default"; fi
+check "tensor: a shrinker with nothing to shrink" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" \
+	-filter truncate -tensor_shrinker gd
+check "tensor: unknown shrinker" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_shrinker mp
+# The flags tensor mode shares with matrix mode.  -aggregator gaussian is
+# matrix mode's only; -preserve_noise_bias keeps the floor, so it must differ;
+# -noise_dof describes the VST and is refused without it; and matrix mode
+# takes one -phase, not one per echo.
+check "tensor: -aggregator gaussian" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -aggregator gaussian
+check "tensor: -aggregator uniform is the default" 0 "$BIN" "$E1" "$WORK/tu.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-aggregator uniform
+if cmp -s "$WORK/tu_echo-1.nii" "$WORK/t_echo-1.nii"
+then ok "tensor: -aggregator uniform is byte-identical to the default"
+else bad "tensor: -aggregator uniform differs from the default"; fi
+check "tensor: -preserve_noise_bias" 0 "$BIN" "$E1" "$WORK/tb.nii" -quiet $TEN -echo "$E2" -echo "$E3" \
+	-preserve_noise_bias
+if cmp -s "$WORK/tb_echo-1.nii" "$WORK/t_echo-1.nii"
+then bad "tensor: -preserve_noise_bias changed nothing"; else ok "tensor: -preserve_noise_bias keeps the floor"; fi
+check "tensor: -noise_dof 4" 0 "$BIN" "$E1" "$WORK/tn.nii" -quiet $TEN -echo "$E2" -echo "$E3" -noise_dof 4
+if cmp -s "$WORK/tn_echo-1.nii" "$WORK/t_echo-1.nii"
+then bad "tensor: -noise_dof 4 changed nothing"; else ok "tensor: -noise_dof reaches the VST"; fi
+check "tensor: -noise_dof without the VST" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -vst n -noise_dof 4
+check "tensor: -aggregator_fwhm is matrix mode's" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" \
+	-aggregator_fwhm 2
+check "matrix: two -phase images" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet -phase "$E2" -phase "$E3"
 check "tensor: echo on another grid"   1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-shift-2.nii"
 check "tensor: echo with another TR"   1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-tr-2.nii"
 check "tensor: echo with fewer volumes" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-short-2.nii"
@@ -907,10 +950,10 @@ done
 C1=$WORK/me-cmag-1.nii; C2=$WORK/me-cmag-2.nii; C3=$WORK/me-cmag-3.nii
 P1=$WORK/me-cphase-1.nii; P2=$WORK/me-cphase-2.nii; P3=$WORK/me-cphase-3.nii
 check "tensor: complex" 0 "$BIN" "$C1" "$WORK/tz.nii" -quiet $TEN -echo "$C2" -echo "$C3" \
-	-tensor_phase "$P1" -tensor_phase "$P2" -tensor_phase "$P3" -phaseunits radians
+	-phase "$P1" -phase "$P2" -phase "$P3" -phaseunits radians
 check "tensor: the same echoes as magnitude" 0 "$BIN" "$C1" "$WORK/tzm.nii" -quiet $TEN -echo "$C2" -echo "$C3"
 if cmp -s "$WORK/tz_echo-3.nii" "$WORK/tzm_echo-3.nii"
-then bad "tensor: -tensor_phase changed nothing"; else ok "tensor: -tensor_phase rotates the echoes"; fi
+then bad "tensor: -phase changed nothing"; else ok "tensor: -phase rotates the echoes"; fi
 before=$(err "$C3" "$WORK/me-clean-3.nii"); after=$(err "$WORK/tz_echo-3.nii" "$WORK/me-clean-3.nii")
 if awk -v a="$after" -v b="$before" 'BEGIN { exit !(a < 0.7 * b) }'
 then ok "tensor: complex echo 3 closer to the truth ($before -> $after)"
@@ -932,11 +975,11 @@ for k in 1 3; do
 	then ok "tensor: echo $k, own noise beats pooled ($own against $pool)"
 	else bad "tensor: echo $k, pooling did as well as each echo's own noise ($pool against $own)"; fi
 done
-check "tensor: -tensor_vst n" 0 "$BIN" "$E1" "$WORK/tv.nii" -quiet $TEN -echo "$E2" -tensor_vst n
-check "tensor: -tensor_vst y with -tensor_phase" 1 "$BIN" "$C1" "$WORK/x.nii" -quiet $TEN -echo "$C2" \
-	-tensor_phase "$P1" -tensor_phase "$P2" -phaseunits radians -tensor_vst y
-check "tensor: -tensor_vst y with -tensor_sigma2" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" \
-	-tensor_sigma2 400 -tensor_vst y
+check "tensor: -vst n" 0 "$BIN" "$E1" "$WORK/tv.nii" -quiet $TEN -echo "$E2" -vst n
+check "tensor: -vst y with -phase" 1 "$BIN" "$C1" "$WORK/x.nii" -quiet $TEN -echo "$C2" \
+	-phase "$P1" -phase "$P2" -phaseunits radians -vst y
+check "tensor: -vst y with -tensor_sigma2" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" \
+	-tensor_sigma2 400 -vst y
 check "tensor: -tensor_noise with -tensor_sigma2" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" \
 	-tensor_sigma2 400 -tensor_noise pooled
 check "tensor: unknown -tensor_noise" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_noise mp
@@ -951,13 +994,13 @@ then ok "tensor: ... names the echo"; else bad "tensor: the noiseless echo was n
 check "tensor: every echo noiseless" 0 "$BIN" "$WORK/me-clean-1.nii" "$WORK/tq.nii" -quiet $TEN \
 	-echo "$WORK/me-clean-2.nii" -echo "$WORK/me-clean-3.nii"
 check "tensor: ... returns the input" 0 "$GEN" rl2 "$WORK/tq_echo-2.nii" "$WORK/me-clean-2.nii" 1e-6
-check "tensor: one phase for two echoes" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_phase "$P1"
-check "tensor: -phaseunits needs -tensor_phase" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -phaseunits radians
+check "tensor: one phase for two echoes" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -phase "$P1"
+check "tensor: -phaseunits needs -phase" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -phaseunits radians
 check_collision "tensor: a phase that is an echo" \
-	"$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_phase "$P1" -tensor_phase "$E2"
+	"$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -phase "$P1" -phase "$E2"
 check "tensor: one echo"               1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN
 check "-echo without -tensor"          1 "$BIN" "$E1" "$WORK/x.nii" -quiet -echo "$E2"
-check "tensor: matrix option refused"  1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -filter truncate
+check "tensor: matrix option refused"  1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -shape cube
 check "tensor: window too large"       1 "$BIN" "$E1" "$WORK/x.nii" -quiet -tensor gd -echo "$E2" -tensor_window 17,3,3
 check "tensor: one-element window"     1 "$BIN" "$E1" "$WORK/x.nii" -quiet -tensor gd -echo "$E2" -tensor_window 3
 check "tensor: bad mode order"         1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$E2" -tensor_order space,time,time

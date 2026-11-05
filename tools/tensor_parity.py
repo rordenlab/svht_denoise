@@ -228,8 +228,8 @@ def image_case(binary, name, data, window, options, mask, order, tmp):
     options = {"sigma2": NOISE_SD**2, **options}
     c_flags = {
         "stride": ("-tensor_stride", lambda v: str(v)),
-        "center_assign": ("-tensor_center", lambda v: "y" if v else "n"),
-        "opt_shrink": ("-tensor_filter", lambda v: "optshrink" if v else "truncate"),
+        "center_assign": ("-aggregator", lambda v: "exclusive" if v else "uniform"),
+        "opt_shrink": ("-filter", lambda v: "optshrink" if v else "truncate"),
         "subtract_mean": ("-tensor_demean", lambda v: "y" if v else "n"),
         "sigma2": ("-tensor_sigma2", lambda v: repr(float(v))),
     }

@@ -229,6 +229,32 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	// The two shrinkers, exactly.  The rank-1 tensor above at s^2 = 70 reaches
+	// the last level as a 4 x 1 unfolding (echo mode by the one kept component)
+	// with r = 1, so its output is the input times the weight eta/s:
+	//   gd:     eta^2 = s^2 - 2(4 + 1) + (4 - 1)^2 / s^2
+	//   olesen: eta^2 = s^2 - 2(3 + 1) + (1 - 3)^2 / s^2   (R = 4-1, C = max(1-1, 1))
+	{
+		const int d[3] = {8, 6, 4};
+		const size_t n = 8 * 6 * 4;
+		double x[8 * 6 * 4], in[8 * 6 * 4];
+		const double s2 = 70.0, amp = sqrt(s2 / (double)n);
+		for (size_t i = 0; i < n; i++) in[i] = amp;
+		const double want[2] = {sqrt(s2 - 8.0 + 4.0 / s2) / sqrt(s2), sqrt(s2 - 10.0 + 9.0 / s2) / sqrt(s2)};
+		for (int obs = 0; obs < 2; obs++) {
+			dn_tensor_opts o = opts(d);
+			o.shrink_observed = obs;
+			memcpy(x, in, sizeof x);
+			int r[3];
+			const int rc = run(&o, x, 1.0, r);
+			double worst = 0.0;
+			for (size_t i = 0; i < n; i++) worst = fmax(worst, fabs(x[i] / in[i] - want[obs]));
+			snprintf(msg, sizeof msg, "rank-1 %s shrinker: weight %.12g, expected %.12g (max error %.2g)",
+			         obs ? "gd" : "olesen", x[0] / in[0], want[obs], worst);
+			report(!rc && worst < 1e-12, msg);
+		}
+	}
+
 	// All zero: nothing kept, nothing invented, at any variance.
 	{
 		const int d[3] = {9, 6, 3};
