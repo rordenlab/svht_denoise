@@ -829,7 +829,7 @@ if [ "$same" -ne 1 ]; then bad "tensor: output depends on the thread count"
 elif [ "${nth:-0}" -ge 2 ]; then ok "tensor: 1 and $nth threads byte-identical"
 elif [ "$ncpu" -ge 2 ]; then bad "tensor: only ${nth:-0} worker ran on $ncpu cores, so threads were not compared"
 else ok "tensor: byte-identical (single-core host: no parallel run to compare)"; fi
-check "tensor: sigma2 0 keeps everything" 0 "$BIN" "$E1" "$WORK/t0.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_sigma2 0
+check "tensor: sigma2 0 keeps all but the numerical-rank floor" 0 "$BIN" "$E1" "$WORK/t0.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_sigma2 0
 check "tensor: sigma2 0 returns the input" 0 "$GEN" rl2 "$WORK/t0_echo-2.nii" "$E2" 1e-6
 # Stride 4 with a 3-wide window: corners 0,4,8,12 in-plane cover 12 of 16, and
 # only corner 0 fits in z, covering 3 of 5 slices.  1280 - 12*12*3 = 848 voxels
@@ -849,9 +849,20 @@ check "tensor: in-plane window" 0 "$BIN" "$E1" "$WORK/tp.nii" -quiet -tensor gd 
 	-echo "$E2" -echo "$E3"
 if cmp -s "$WORK/tp_echo-1.nii" "$WORK/t_echo-1.nii"
 then bad "tensor: an in-plane window gave the local window's answer"; else ok "tensor: in-plane window differs from local"; fi
+# Each option must reach the kernel: an output that matches the default means
+# it was ignored, and an anchor pins what it does.  Demeaning moves the RMS by
+# only 6e-6, so its anchor alone would barely separate it; the cmp does.
 check "tensor: center assignment" 0 "$BIN" "$E1" "$WORK/tc.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_center y
 check "tensor: demeaned" 0 "$BIN" "$E1" "$WORK/td.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_demean y
 check "tensor: mode order" 0 "$BIN" "$E1" "$WORK/to.nii" -quiet $TEN -echo "$E2" -echo "$E3" -tensor_order time,space,echo
+for opt in tc:-tensor_center td:-tensor_demean to:-tensor_order; do
+	f=${opt%%:*}; name=${opt#*:}
+	if cmp -s "$WORK/${f}_echo-1.nii" "$WORK/t_echo-1.nii"
+	then bad "tensor: $name gave the default answer"; else ok "tensor: $name changes the output"; fi
+done
+check "tensor: center assignment RMS anchor" 0 "$GEN" rms "$WORK/tc_echo-1.nii" 668.046525 1e-6
+check "tensor: demeaned RMS anchor" 0 "$GEN" rms "$WORK/td_echo-1.nii" 667.610777 1e-6
+check "tensor: mode order RMS anchor" 0 "$GEN" rms "$WORK/to_echo-1.nii" 667.628282 1e-6
 check "tensor: echo on another grid"   1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-shift-2.nii"
 check "tensor: echo with another TR"   1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-tr-2.nii"
 check "tensor: echo with fewer volumes" 1 "$BIN" "$E1" "$WORK/x.nii" -quiet $TEN -echo "$WORK/me-short-2.nii"

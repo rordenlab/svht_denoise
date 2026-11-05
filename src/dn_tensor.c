@@ -114,9 +114,12 @@ size_t dn_tensor_work_bytes(const dn_tensor_opts *o) {
 		if (g * g > g2) g2 = g * g;
 		uf += (size_t)o->dims[k] * g;
 	}
-	// Four n-blocks, the Gram and its vectors, the left factors, and up to one
-	// eigensolver per mode resident at a time (each holds two g^2 blocks).
-	return (4 * n + 2 * g2 + uf + 2 * g2 * (size_t)o->nmodes) * sizeof(double);
+	// Four n-blocks, the Gram and its vectors, the left factors, and every
+	// cached eigensolver (each holds two g^2 blocks).  The cache can hold more
+	// sizes than there are modes, because a level's Gram size follows the rank
+	// found at the level before, so all DN_TENSOR_EIG_SLOTS are priced at the
+	// largest size.
+	return (4 * n + 2 * g2 + uf + 2 * g2 * (size_t)DN_TENSOR_EIG_SLOTS) * sizeof(double);
 }
 
 dn_tensor_work *dn_tensor_work_create(const dn_tensor_opts *o) {
@@ -350,7 +353,13 @@ int dn_tensor_denoise(const dn_tensor_opts *o, dn_tensor_work *w, double *x,
 		const double *f = NULL;
 		if (lev == K - 1 && o->shrink_last && r > 0) {
 			// Gavish & Donoho 2017's Frobenius-optimal shrinkage, in unnormalized
-			// units, against the residual sizes left once r are kept.
+			// units, against the residual sizes left once r are kept.  The rank
+			// adjustment is Olesen's (Tensor-MP-PCA, kept by ME-PCA), not GD's:
+			// matrix mode uses the observed m and c.  It shrinks kept values
+			// slightly less (rows 5 -> 1 at five echoes, ~1% of the subtracted
+			// term on ds006131), and its zero lies BELOW the bulk edge, so the
+			// edge cut above, not the shrinker, decides what is discarded.  Kept
+			// for parity with ME-PCA; changing it is a methods change.
 			const double rows = fmax((double)(m - r), 1.0), cols = fmax((double)c - r, 1.0);
 			for (int k = 0; k < r; k++) {
 				const double s2 = w->evals[g - 1 - k];
