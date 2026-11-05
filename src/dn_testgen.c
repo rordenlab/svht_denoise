@@ -11,6 +11,9 @@
 //   dn_testgen cmpmask <a> <b> <mask>          exit 0 if a == b inside the mask, a == 0 outside
 //   dn_testgen rms <file.nii> <want> <reltol>  exit 0 if the RMS still matches
 //   dn_testgen neg <file.nii>                  exit 0 if any value is negative
+//   dn_testgen nan <file.nii> <count>          exit 0 if exactly <count> values are NaN
+//   dn_testgen volrms <f> <vol> <want> <tol>   exit 0 if volume <vol>'s RMS still matches
+//   dn_testgen cmpnan <a> <b> <map> <tol>      exit 0 if a == b (relative) where map is NaN
 //
 // Fixtures are 9x9x3 x 8 volumes and deterministic, except:
 //   mask            a single volume          mask-wrongdim  7x9x3 x 1
@@ -22,6 +25,7 @@
 //   rician(-clean, -zero)  9x9x5 x 48 low-SNR magnitude, truth, isolated zeros
 //   mag-even        9x10x3 -- the only shape -pF 0.75 runs on at all
 //   mag-shorty      9x6x3, even too, but its -pF interleaves are too short
+//   me-*            16x16x5 x 12 multi-echo magnitude for tensor mode (see there)
 //
 // Every phase kind bar phase-siemens encodes the SAME underlying phase, so any
 // two of them must denoise to the same answer.
@@ -91,6 +95,8 @@ static int write_pair(const char *prefix, const float *data, int nt, double vox)
 
 // Slice thickness relative to the in-plane spacing; only "mag-aniso" changes it.
 static double vox_z_scale = 1.0;
+// Repetition time and x origin; only the "me-tr" and "me-shift" echoes change them.
+static double vox_tr = 1.0, origin_x = 0.0;
 
 static int write_nii_dim(const char *path, const float *data, int nx, int ny, int nz, int nt, double vox) {
 	nhdr1 h;
@@ -106,12 +112,13 @@ static int write_nii_dim(const char *path, const float *data, int nx, int ny, in
 	h.pixdim[0] = 1.0f;
 	h.pixdim[1] = h.pixdim[2] = (float)vox;
 	h.pixdim[3] = (float)(vox * vox_z_scale);
-	h.pixdim[4] = 1.0f;
+	h.pixdim[4] = (float)vox_tr;
 	h.vox_offset = 352.0f;
 	h.scl_slope = 0.0f;         // "no scaling" per the standard
 	h.xyzt_units = 2;           // NIFTI_UNITS_MM
 	h.sform_code = 1;
 	h.srow_x[0] = (float)vox; h.srow_y[1] = (float)vox; h.srow_z[2] = (float)(vox * vox_z_scale);
+	h.srow_x[3] = (float)origin_x;
 	memcpy(h.magic, "n+1", 4);
 
 	FILE *f = fopen(path, "wb");
@@ -129,13 +136,14 @@ static int write_nii(const char *path, const float *data, int nt, double vox) {
 	return write_nii_dim(path, data, NX, NY, NZ, nt, vox);
 }
 
-static int write_pair(const char *prefix, const float *data, int nt, double vox) {
+static int write_pair_dim(const char *prefix, const float *data, int nx, int ny, int nz, int nt, double vox) {
 	char hdr[1024], img[1024];
 	if ((size_t)snprintf(hdr, sizeof hdr, "%s.hdr", prefix) >= sizeof hdr) return 1;
 	if ((size_t)snprintf(img, sizeof img, "%s.img", prefix) >= sizeof img) return 1;
+	const size_t nvox = (size_t)nx * ny * nz * nt;
 
 	// Reuse write_nii's header construction by writing a .nii, then splitting it.
-	if (write_nii(hdr, data, nt, vox)) return 1;
+	if (write_nii_dim(hdr, data, nx, ny, nz, nt, vox)) return 1;
 	FILE *f = fopen(hdr, "r+b");
 	if (!f) { perror(hdr); return 1; }
 	nhdr1 h;
@@ -153,10 +161,14 @@ static int write_pair(const char *prefix, const float *data, int nt, double vox)
 		ok = w && n >= sizeof h && fwrite(buf, sizeof h, 1, w) == 1;
 		if (w && fclose(w) != 0) ok = 0; }
 	if (ok) { FILE *w = fopen(img, "wb");
-		ok = w && fwrite(data, sizeof(float), (size_t)N3 * nt, w) == (size_t)N3 * nt;
+		ok = w && fwrite(data, sizeof(float), nvox, w) == nvox;
 		if (w && fclose(w) != 0) ok = 0; }
 	if (!ok) fprintf(stderr, "failed writing the %s pair\n", prefix);
 	return ok ? 0 : 1;
+}
+
+static int write_pair(const char *prefix, const float *data, int nt, double vox) {
+	return write_pair_dim(prefix, data, NX, NY, NZ, nt, vox);
 }
 
 static float *read_nii(const char *path, int *nvox) {
@@ -308,6 +320,57 @@ int main(int argc, char **argv) {
 	// question directly.  It cannot distinguish truncation from rectification --
 	// neither leaves a negative -- so the mag-signed/mag-clamped byte-identity
 	// pair in test.sh is what pins which of the two we perform.
+	// Print the number of NaN values; exit 0 if it is exactly <want>.  Tensor
+	// mode marks voxels no window covered with NaN in every map, so the count
+	// pins the window geometry: which corners exist, and what each covers.
+	if (argc == 4 && !strcmp(argv[1], "nan")) {
+		int n = 0;
+		float *a = read_nii(argv[2], &n);
+		if (!a) return 2;
+		int nnan = 0;
+		for (int i = 0; i < n; i++) nnan += isnan(a[i]) != 0;
+		free(a);
+		printf("%d\n", nnan);
+		return nnan == atoi(argv[3]) ? 0 : 1;
+	}
+	// RMS of volume <vol> (0-based) alone: a per-echo noise map is one volume
+	// per echo, and the whole-file RMS would blend the echoes it must keep apart.
+	if (argc == 6 && !strcmp(argv[1], "volrms")) {
+		nhdr1 h;
+		FILE *f = fopen(argv[2], "rb");
+		if (!f || fread(&h, sizeof h, 1, f) != 1) { if (f) fclose(f); return 2; }
+		fclose(f);
+		const int nt = h.dim[0] >= 4 && h.dim[4] > 0 ? h.dim[4] : 1, vol = atoi(argv[3]);
+		int n = 0;
+		float *a = read_nii(argv[2], &n);
+		if (!a || n % nt || vol < 0 || vol >= nt) { free(a); return 2; }
+		const int n3 = n / nt;
+		double s = 0.0;
+		for (int i = 0; i < n3; i++) s += (double)a[(size_t)vol * n3 + i] * a[(size_t)vol * n3 + i];
+		free(a);
+		const double rms = sqrt(s / n3), want = atof(argv[4]);
+		printf("%.9g\n", rms);
+		return (want != 0.0 && fabs(rms - want) / fabs(want) <= atof(argv[5])) ? 0 : 1;
+	}
+	// a == b, relative to |b|, wherever the 3D <map> is NaN: tensor mode's
+	// uncovered voxels, which must keep their input value through the noise
+	// normalization and back.  Prints the count and the worst relative difference.
+	if (argc == 6 && !strcmp(argv[1], "cmpnan")) {
+		int na = 0, nb = 0, nm = 0;
+		float *a = read_nii(argv[2], &na), *b = read_nii(argv[3], &nb), *mk = read_nii(argv[4], &nm);
+		if (!a || !b || !mk || na != nb || nm <= 0 || na % nm) { free(a); free(b); free(mk); return 2; }
+		int count = 0;
+		double worst = 0.0;
+		for (int i = 0; i < na; i++) {
+			if (!isnan(mk[i % nm])) continue;
+			count++;
+			const double d = fabs((double)a[i] - b[i]) / fmax(fabs((double)b[i]), 1.0);
+			if (d > worst) worst = d;
+		}
+		free(a); free(b); free(mk);
+		printf("%d uncovered samples, worst relative difference %.3g\n", count, worst);
+		return count > 0 && worst <= atof(argv[5]) ? 0 : 1;
+	}
 	if (argc == 3 && !strcmp(argv[1], "neg")) {
 		int n = 0;
 		float *a = read_nii(argv[2], &n);
@@ -326,7 +389,10 @@ int main(int argc, char **argv) {
 		                "       dn_testgen cmpmask <a.nii> <b.nii> <mask.nii>\n"
 		                "       dn_testgen nozero <file.nii>\n"
 		                "       dn_testgen rms  <file.nii> <expected> <reltol>\n"
-		                "       dn_testgen neg  <file.nii>\n");
+		                "       dn_testgen neg  <file.nii>\n"
+		                "       dn_testgen nan  <file.nii> <count>\n"
+		                "       dn_testgen volrms <file.nii> <vol> <expected> <reltol>\n"
+		                "       dn_testgen cmpnan <a.nii> <b.nii> <map.nii> <reltol>\n");
 		return 2;
 	}
 
@@ -588,6 +654,83 @@ int main(int argc, char **argv) {
 		if (fclose(f) != 0) ok2 = 0;
 		free(d);
 		return ok2 ? 0 : 1;
+	} else if (!strncmp(kind, "me-", 3)) {
+		// Multi-echo magnitude for tensor mode: 16x16x5 x 12 volumes per echo,
+		// echo times 15/35/55.  A smooth S0, a smooth R2* and two slow temporal
+		// components make a low Tucker rank signal, under Gaussian noise of SD 20
+		// on a signal of ~1000.  The 16x16 plane gives a 3-wide window five tiles
+		// per axis, so a many-thread run really runs in parallel.
+		//   me-<k>          echo k (1-3), noisy     me-clean-<k>  its truth
+		//   me-shift-<k>    echo k on a grid 1 mm off in x
+		//   me-tr-<k>       echo k with a TR of 2 instead of 1
+		//   me-short-<k>    echo k with 11 volumes
+		//   me-neg-<k>      echo k with one negative sample
+		//   me-cmag-<k>, me-cphase-<k>  echo k as COMPLEX data: the same signal under a
+		//                   smooth phase that grows with TE and drifts in time, plus
+		//                   complex Gaussian noise of SD 20 per component; magnitude,
+		//                   and phase in radians
+		//   me-hetero-<k>   echo k with noise SD 40, 20, 10 for k = 1, 2, 3, as echoes
+		//                   reconstructed with echo-specific parallel imaging can have
+		//   me-mask         a 3D mask, a slab in the middle with a hole
+		const int enx = 16, eny = 16, enz = 5, en3 = enx * eny * enz;
+		int ent = 12, echo = 0, clean = 0, neg = 0, cplx = 0, hetero = 0;
+		const char *num = kind + 3;
+		if (!strcmp(num, "mask")) {
+			float *b = (float *)malloc((size_t)en3 * sizeof(float));
+			if (!b) { free(d); return 2; }
+			for (int v = 0; v < en3; v++) {
+				const int x = v % enx, y = (v / enx) % eny, z = v / (enx * eny);
+				b[v] = (x >= 3 && x < 11 && y >= 4 && y < 12 && z >= 1 && z < 4 &&
+				        !(x >= 6 && x < 8 && y >= 7 && y < 9 && z == 2)) ? 1.0f : 0.0f;
+			}
+			rc = as_pair ? write_pair_dim(argv[3], b, enx, eny, enz, 1, vox)
+			             : write_nii_dim(argv[3], b, enx, eny, enz, 1, vox);
+			free(b);
+			free(d);
+			return rc;
+		}
+		if (!strncmp(num, "clean-", 6)) { clean = 1; num += 6; }
+		else if (!strncmp(num, "shift-", 6)) { origin_x = 1.0; num += 6; }
+		else if (!strncmp(num, "tr-", 3)) { vox_tr = 2.0; num += 3; }
+		else if (!strncmp(num, "short-", 6)) { ent = 11; num += 6; }
+		else if (!strncmp(num, "neg-", 4)) { neg = 1; num += 4; }
+		else if (!strncmp(num, "cmag-", 5)) { cplx = 1; num += 5; }
+		else if (!strncmp(num, "cphase-", 7)) { cplx = 2; num += 7; }
+		else if (!strncmp(num, "hetero-", 7)) { hetero = 1; num += 7; }
+		echo = atoi(num);
+		if (echo < 1 || echo > 3) {
+			fprintf(stderr, "unknown fixture kind '%s'\n", kind);
+			free(d);
+			return 2;
+		}
+		const double te = 15.0 + 20.0 * (echo - 1);
+		const double sd = hetero ? 40.0 / (1 << (echo - 1)) : 20.0;
+		float *b = (float *)malloc((size_t)en3 * ent * sizeof(float));
+		if (!b) { free(d); return 2; }
+		for (int t2 = 0; t2 < ent; t2++)
+			for (int v = 0; v < en3; v++) {
+				const int x = v % enx, y = (v / enx) % eny, z = v / (enx * eny);
+				const double s0 = 800.0 + 300.0 * sin(0.4 * x) * cos(0.3 * y) + 40.0 * z;
+				const double r2 = 0.02 + 0.005 * cos(0.25 * (x + y));
+				const double bold = 1.0 + 0.05 * sin(0.6 * t2 + 0.2 * x) + 0.03 * cos(0.9 * t2);
+				const uint32_t i = (uint32_t)((echo * ent + t2) * en3 + v) * 2u;
+				const double g = sqrt(-2.0 * log(1.0 - rng(i))) * cos(2.0 * M_PI * rng(i + 1));
+				const double s = s0 * bold * exp(-te * r2);
+				if (cplx) {
+					const double ph = te * (0.05 * sin(0.3 * x + 0.2 * y) + 0.01 * z) + 0.2 * sin(0.4 * t2);
+					const double h = sqrt(-2.0 * log(1.0 - rng(i))) * sin(2.0 * M_PI * rng(i + 1));
+					const double re = s * cos(ph) + 20.0 * g, im = s * sin(ph) + 20.0 * h;
+					b[(size_t)t2 * en3 + v] = (float)(cplx == 1 ? sqrt(re * re + im * im) : atan2(im, re));
+					continue;
+				}
+				b[(size_t)t2 * en3 + v] = (float)(clean ? s : fabs(s + sd * g));
+			}
+		if (neg) b[17] = -1.0f;
+		rc = as_pair ? write_pair_dim(argv[3], b, enx, eny, enz, ent, vox)
+		             : write_nii_dim(argv[3], b, enx, eny, enz, ent, vox);
+		free(b);
+		free(d);
+		return rc;
 	} else if (!strcmp(kind, "phase-const")) {
 		for (int i = 0; i < NVOX; i++) d[i] = 1234.0f;
 	} else {

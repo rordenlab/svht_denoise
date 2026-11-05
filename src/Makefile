@@ -235,6 +235,7 @@ NIFTI_CFLAGS = $(REQ_CFLAGS) $(OPT) -w $(DEFS) $(ZLIB_CFLAGS) $(CPPFLAGS)
 .DEFAULT_GOAL := all
 
 OBJS  = dn.o dn_bval.o dn_coef.o dn_lambda_star.o dn_eig.o dn_patch.o dn_nii.o dn_phase.o dn_run.o dn_sigma.o dn_agg.o dn_vst.o \
+        dn_tensor.o dn_tensor_run.o \
         $(DEGIBBS_OBJS)
 MAIN  = svht_denoise.o
 NIFTI = nifti_io.o
@@ -269,7 +270,7 @@ CURFLAGS  := $(CC) $(ALL_CFLAGS) $(LDLIBS)
 # open under -j.  A MISSING object cannot be mis-dated, which is why deleting
 # beats any amount of dependency ordering here.
 ifneq ($(strip $(CURFLAGS)),$(strip $(shell cat $(FLAGSTAMP) 2>/dev/null)))
-  $(shell rm -f *.o mrdegibbs/*.o svht_denoise dn_testgen)
+  $(shell rm -f *.o mrdegibbs/*.o svht_denoise dn_testgen dn_tensortest)
 endif
 .PHONY: force
 force: ;
@@ -301,7 +302,18 @@ TESTGEN = dn_testgen
 $(TESTGEN): dn_testgen.c $(FLAGSTAMP)
 	$(CC) $(ALL_CFLAGS) -o $@ dn_testgen.c -lm
 
-test: $(BIN) $(TESTGEN)
+# The tensor kernel's own checks, on in-memory tensors: properties no NIfTI
+# fixture can isolate (the noise-pass shortcut against the explicit chain, exact
+# reconstruction at sigma2 = 0).  Linked against the same objects as the tool,
+# so a sanitizer build instruments it too.
+TENSORTEST = dn_tensortest
+TENSORTEST_OBJS = dn.o dn_coef.o dn_eig.o dn_lambda_star.o dn_tensor.o
+
+$(TENSORTEST): dn_tensortest.o $(TENSORTEST_OBJS)
+	$(CC) $(ALL_CFLAGS) -o $@ dn_tensortest.o $(TENSORTEST_OBJS) $(LDLIBS)
+
+test: $(BIN) $(TESTGEN) $(TENSORTEST)
+	@./$(TENSORTEST)
 	@BIN=./$(BIN) GEN=./$(TESTGEN) sh test.sh
 
 # Say which zlib went in.  The two differ in .nii.gz WRITE speed by about 3x, so
@@ -361,7 +373,7 @@ $(ZNG_BUILD)/libz.a: $(ZNG_REV)
 %.o: %.c $(FLAGSTAMP)
 	$(CC) $(ALL_CFLAGS) -MMD -MP -c -o $@ $<
 
--include $(OBJS:.o=.d) $(MAIN:.o=.d)
+-include $(OBJS:.o=.d) $(MAIN:.o=.d) dn_tensortest.d
 
 debug:
 	$(MAKE) OPT="-O0 -g" all
@@ -513,7 +525,7 @@ check-notary-profile:
 # executable whose own minos still reads 11.0, so the package check passes and
 # nothing fails.  Rebuilding it costs a couple of seconds.
 clean:
-	rm -f *.o *.d mrdegibbs/*.o mrdegibbs/*.d $(BIN) $(TESTGEN) $(FLAGSTAMP)
+	rm -f *.o *.d mrdegibbs/*.o mrdegibbs/*.d $(BIN) $(TESTGEN) $(TENSORTEST) $(FLAGSTAMP)
 	rm -rf $(ZNG_BUILD) $(ZNG_REV)
 
 # Debug builds leave a .dSYM bundle beside the binary; sweep it too.

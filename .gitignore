@@ -6,6 +6,7 @@ src/mrdegibbs/*.o
 src/mrdegibbs/*.d
 src/svht_denoise
 src/dn_testgen
+src/dn_tensortest
 *.dSYM/
 
 # Build flag stamp (see src/Makefile)
